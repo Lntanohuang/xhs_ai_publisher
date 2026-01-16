@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import sys
 from typing import List, Optional
 
 from sqlalchemy import and_, or_
@@ -133,21 +134,39 @@ class UserService:
                 from src.core.services.browser_environment_service import browser_environment_service
 
                 if not browser_environment_service.get_default_environment(user.id):
+                    # 默认环境尽量与当前系统一致，避免 UA/platform 与 OS 不一致导致登录风控
+                    if sys.platform == "darwin":
+                        default_env_kwargs = dict(
+                            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            viewport_width=1440,
+                            viewport_height=764,
+                            screen_width=1440,
+                            screen_height=900,
+                            platform="MacIntel",
+                            timezone="Asia/Shanghai",
+                            locale="zh-CN",
+                            webgl_vendor="Apple Inc.",
+                            webgl_renderer="Apple GPU",
+                        )
+                    else:
+                        default_env_kwargs = dict(
+                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            viewport_width=1920,
+                            viewport_height=937,
+                            screen_width=1920,
+                            screen_height=1080,
+                            platform="Win32",
+                            timezone="Asia/Shanghai",
+                            locale="zh-CN",
+                            webgl_vendor="Google Inc. (Intel)",
+                            webgl_renderer="ANGLE (Intel, Intel(R) HD Graphics Direct3D11)",
+                        )
                     browser_environment_service.create_environment(
                         user_id=user.id,
                         name="默认环境",
                         proxy_enabled=False,
                         proxy_type="direct",
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        viewport_width=1920,
-                        viewport_height=937,
-                        screen_width=1920,
-                        screen_height=1080,
-                        platform="Win32",
-                        timezone="Asia/Shanghai",
-                        locale="zh-CN",
-                        webgl_vendor="Google Inc. (Intel)",
-                        webgl_renderer="ANGLE (Intel, Intel(R) HD Graphics Direct3D11)",
+                        **default_env_kwargs,
                     )
             except Exception:
                 # 环境创建失败不影响用户创建

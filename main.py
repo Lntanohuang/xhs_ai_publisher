@@ -17,6 +17,7 @@ from src.core.pages.user_management_page import UserManagementPage
 from src.core.pages.simple_backend_config import BackendConfigPage
 from src.core.pages.cover_center_page import CoverCenterPage
 from src.core.pages.data_center_page import DataCenterPage
+from src.core.alert import TipWindow
 from src.logger.logger import Logger
 
 # 设置日志文件路径
@@ -301,6 +302,19 @@ class XiaohongshuUI(QMainWindow):
         
         # 启动定时发布调度器
         from src.core.scheduler.schedule_manager import schedule_manager
+        self.schedule_manager = schedule_manager
+        try:
+            # 任务到期：派发给浏览器线程执行
+            self.schedule_manager.task_execute_requested.connect(self.enqueue_scheduled_task)
+            # 浏览器线程回传执行结果：更新任务状态（跨线程安全）
+            self.browser_thread.scheduled_task_result.connect(self.schedule_manager.handle_task_result)
+
+            # 可选：提示执行状态
+            self.schedule_manager.task_started.connect(self.on_scheduled_task_started)
+            self.schedule_manager.task_completed.connect(self.on_scheduled_task_completed)
+            self.schedule_manager.task_failed.connect(self.on_scheduled_task_failed)
+        except Exception as e:
+            print(f"⚠️ 定时发布信号连接失败: {e}")
         
         # 启动下载器线程
         self.start_downloader_thread()
@@ -349,6 +363,61 @@ class XiaohongshuUI(QMainWindow):
         if preview_btn:
             preview_btn.setText(text)
             preview_btn.setEnabled(enabled)
+
+    def enqueue_scheduled_task(self, task: object):
+        """接收调度器的到期任务，并加入浏览器线程队列执行。"""
+        try:
+            data = task if isinstance(task, dict) else {}
+            self.browser_thread.action_queue.append(
+                {
+                    "type": "scheduled_publish",
+                    "task_id": data.get("task_id"),
+                    "user_id": data.get("user_id"),
+                    "title": data.get("title"),
+                    "content": data.get("content"),
+                    "images": data.get("images"),
+                    # 热点任务相关字段（用于到点重新生成内容/图片）
+                    "task_type": data.get("task_type"),
+                    "interval_hours": data.get("interval_hours"),
+                    "hotspot_source": data.get("hotspot_source"),
+                    "hotspot_rank": data.get("hotspot_rank"),
+                    "use_hotspot_context": data.get("use_hotspot_context"),
+                    "cover_template_id": data.get("cover_template_id"),
+                    "page_count": data.get("page_count"),
+                }
+            )
+        except Exception as e:
+            task_id = ""
+            try:
+                task_id = str((task or {}).get("task_id") or "")
+            except Exception:
+                task_id = ""
+            try:
+                if getattr(self, "schedule_manager", None) and task_id:
+                    self.schedule_manager.handle_task_result(task_id, False, str(e))
+            except Exception:
+                pass
+
+    def on_scheduled_task_started(self, task_id: str):
+        try:
+            TipWindow(self, f"⏰ 定时任务开始执行：{task_id}").show()
+        except Exception:
+            pass
+
+    def on_scheduled_task_completed(self, task_id: str):
+        try:
+            TipWindow(self, f"✅ 定时任务发布成功：{task_id}").show()
+        except Exception:
+            pass
+
+    def on_scheduled_task_failed(self, task_id: str, reason: str):
+        try:
+            msg = f"❌ 定时任务发布失败：{task_id}"
+            if reason:
+                msg += f"\n{reason}"
+            TipWindow(self, msg).show()
+        except Exception:
+            pass
 
     def switch_page(self, index):
         """切换页面"""

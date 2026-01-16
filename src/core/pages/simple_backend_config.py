@@ -213,6 +213,7 @@ class SimpleBackendConfigPage(QWidget):
         # 启用开关
         self.schedule_enabled = QCheckBox("✅ 启用定时发布功能")
         self.schedule_enabled.setFont(QFont(get_ui_font_family(), 16))
+        self.schedule_enabled.stateChanged.connect(self.on_schedule_enabled_changed)
         layout.addWidget(self.schedule_enabled)
         
         # 创建分组
@@ -241,10 +242,290 @@ class SimpleBackendConfigPage(QWidget):
         group_layout.addRow("📊 每日限制：", self.max_posts)
         
         layout.addWidget(group)
+
+        # 任务列表
+        tasks_group = QGroupBox("任务列表")
+        tasks_layout = QVBoxLayout(tasks_group)
+        tasks_layout.setContentsMargins(16, 16, 16, 16)
+        tasks_layout.setSpacing(10)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
+
+        create_btn = QPushButton("➕ 创建任务")
+        create_btn.clicked.connect(self.create_schedule_task)
+        action_row.addWidget(create_btn)
+
+        refresh_btn = QPushButton("🔄 刷新任务")
+        refresh_btn.clicked.connect(self.refresh_schedule_tasks)
+        action_row.addWidget(refresh_btn)
+
+        delete_btn = QPushButton("🗑️ 删除所选")
+        delete_btn.clicked.connect(self.delete_selected_schedule_task)
+        action_row.addWidget(delete_btn)
+
+        clear_btn = QPushButton("🧹 清理已完成")
+        clear_btn.clicked.connect(self.clear_completed_schedule_tasks)
+        action_row.addWidget(clear_btn)
+
+        open_btn = QPushButton("📂 打开任务目录")
+        open_btn.clicked.connect(self.open_schedule_tasks_dir)
+        action_row.addWidget(open_btn)
+
+        action_row.addStretch()
+        tasks_layout.addLayout(action_row)
+
+        self.schedule_tasks_list = QListWidget()
+        self.schedule_tasks_list.setMinimumHeight(240)
+        tasks_layout.addWidget(self.schedule_tasks_list)
+
+        layout.addWidget(tasks_group)
         layout.addStretch()
         
         scroll.setWidget(widget)
         return scroll
+
+    def create_schedule_task(self):
+        """创建一个新的定时发布任务（手动输入内容/选择热点）。"""
+        try:
+            # 只允许选择“已登录”的用户（无人值守避免验证码）
+            try:
+                from src.core.services.user_service import user_service
+
+                current_user = user_service.get_current_user()
+                users = [u for u in user_service.list_users(active_only=True) if getattr(u, "is_logged_in", False)]
+            except Exception:
+                users = []
+                current_user = None
+
+            if not users:
+                QMessageBox.information(self, "提示", "没有已登录用户，请先登录后再创建定时任务。")
+                return
+
+            default_user_id = getattr(current_user, "id", None) if current_user else getattr(users[0], "id", None)
+
+            default_interval_hours = 2
+            try:
+                default_interval_hours = int(self.config.get_schedule_config().get("interval_hours", 2) or 2)
+            except Exception:
+                default_interval_hours = 2
+
+            from src.core.pages.scheduled_publish_dialog import ScheduledPublishDialog
+
+            dialog = ScheduledPublishDialog(
+                self,
+                users=users,
+                default_user_id=default_user_id,
+                default_interval_hours=default_interval_hours,
+                initial_title="",
+                initial_content="",
+                initial_images=[],
+                default_task_type="fixed",
+            )
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                return
+
+            user_id = dialog.get_user_id()
+            schedule_time = dialog.get_schedule_time()
+            if not user_id:
+                QMessageBox.warning(self, "失败", "请选择发布账号。")
+                return
+            if not hasattr(schedule_time, "isoformat"):
+                QMessageBox.warning(self, "失败", "发布时间无效。")
+                return
+
+            from src.core.scheduler.schedule_manager import schedule_manager
+
+            task_type = dialog.get_task_type()
+            if task_type == "hotspot":
+                source = dialog.get_hotspot_source()
+                rank = dialog.get_hotspot_rank()
+                interval_hours = dialog.get_interval_hours()
+                use_ctx = dialog.get_use_hotspot_context()
+
+                cover_template_id = ""
+                try:
+                    cover_template_id = str(self.config.get_templates_config().get("selected_cover_template_id") or "").strip()
+                except Exception:
+                    cover_template_id = ""
+
+                task_id = schedule_manager.add_task(
+                    content="",
+                    schedule_time=schedule_time,
+                    title=f"热点({source}) #{rank}",
+                    images=[],
+                    user_id=int(user_id),
+                    task_type="hotspot",
+                    interval_hours=int(interval_hours),
+                    hotspot_source=str(source),
+                    hotspot_rank=int(rank),
+                    use_hotspot_context=bool(use_ctx),
+                    cover_template_id=cover_template_id,
+                    page_count=3,
+                )
+            else:
+                title = dialog.get_fixed_title()
+                content = dialog.get_fixed_content()
+                images = dialog.get_fixed_images()
+
+                if not title and not content:
+                    QMessageBox.warning(self, "失败", "请输入标题或正文。")
+                    return
+
+                cover_template_id = ""
+                try:
+                    cover_template_id = str(self.config.get_templates_config().get("selected_cover_template_id") or "").strip()
+                except Exception:
+                    cover_template_id = ""
+
+                task_id = schedule_manager.add_task(
+                    content=content,
+                    schedule_time=schedule_time,
+                    title=title,
+                    images=images,
+                    user_id=int(user_id),
+                    task_type="fixed",
+                    cover_template_id=cover_template_id,
+                    page_count=3,
+                )
+
+            QMessageBox.information(self, "成功", f"已创建定时任务：{task_id}")
+            try:
+                self.refresh_schedule_tasks()
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.warning(self, "失败", f"创建任务失败：{str(e)}")
+
+    def on_schedule_enabled_changed(self, state: int):
+        """启用/停用定时调度器（应用需保持开启）。"""
+        try:
+            from src.core.scheduler.schedule_manager import schedule_manager
+
+            enabled = bool(state)
+            if enabled:
+                schedule_manager.start_scheduler()
+            else:
+                schedule_manager.stop_scheduler()
+        except Exception:
+            pass
+
+    def refresh_schedule_tasks(self):
+        """刷新定时任务列表。"""
+        try:
+            if not hasattr(self, "schedule_tasks_list"):
+                return
+
+            from src.core.scheduler.schedule_manager import schedule_manager
+
+            # 读取用户映射
+            user_map = {}
+            try:
+                from src.core.services.user_service import user_service
+
+                for u in user_service.list_users(active_only=False):
+                    user_map[int(u.id)] = u
+            except Exception:
+                user_map = {}
+
+            self.schedule_tasks_list.clear()
+            tasks = schedule_manager.get_tasks()
+            tasks = sorted(tasks, key=lambda t: getattr(t, "schedule_time", datetime.now()))
+
+            status_icon = {
+                "pending": "🕒",
+                "running": "⏳",
+                "completed": "✅",
+                "failed": "❌",
+            }
+
+            for t in tasks:
+                try:
+                    uid = getattr(t, "user_id", None)
+                    user_obj = user_map.get(int(uid)) if uid is not None else None
+                    user_label = ""
+                    if user_obj:
+                        name = (user_obj.display_name or user_obj.username or user_obj.phone or f"用户{user_obj.id}").strip()
+                        login_tag = "✅" if getattr(user_obj, "is_logged_in", False) else "❌"
+                        user_label = f"{name} {login_tag}"
+                    else:
+                        user_label = "当前用户" if uid is None else f"用户{uid}"
+
+                    st = getattr(t, "status", "pending")
+                    icon = status_icon.get(st, "•")
+                    title = (getattr(t, "title", "") or "").strip() or "（无标题）"
+                    try:
+                        ts = getattr(t, "schedule_time").strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        ts = str(getattr(t, "schedule_time", ""))
+
+                    retry = f"{getattr(t, 'retry_count', 0)}/{getattr(t, 'max_retries', 0)}"
+                    text = f"{icon} {ts} ｜ {user_label} ｜ {title} ｜ {st} ｜ 重试 {retry}"
+
+                    item = QListWidgetItem(text)
+                    item.setData(Qt.UserRole, str(getattr(t, "task_id", "")))
+
+                    tooltip_lines = [
+                        f"任务ID: {getattr(t, 'task_id', '')}",
+                        f"账号: {user_label}",
+                        f"时间: {ts}",
+                        f"状态: {st}",
+                    ]
+                    err = (getattr(t, "error_message", "") or "").strip()
+                    if err:
+                        tooltip_lines.append(f"错误: {err}")
+                    item.setToolTip("\n".join(tooltip_lines))
+
+                    self.schedule_tasks_list.addItem(item)
+                except Exception:
+                    continue
+
+            if self.schedule_tasks_list.count() == 0:
+                self.schedule_tasks_list.addItem(QListWidgetItem("（暂无任务）"))
+        except Exception:
+            pass
+
+    def delete_selected_schedule_task(self):
+        try:
+            if not hasattr(self, "schedule_tasks_list"):
+                return
+
+            items = self.schedule_tasks_list.selectedItems()
+            if not items:
+                QMessageBox.information(self, "提示", "请先选择一个任务")
+                return
+
+            task_id = items[0].data(Qt.UserRole)
+            if not task_id:
+                return
+
+            reply = QMessageBox.question(self, "确认删除", f"确定要删除任务 {task_id} 吗？", QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+
+            from src.core.scheduler.schedule_manager import schedule_manager
+
+            schedule_manager.remove_task(str(task_id))
+            self.refresh_schedule_tasks()
+        except Exception as e:
+            QMessageBox.warning(self, "失败", f"删除任务失败：{str(e)}")
+
+    def clear_completed_schedule_tasks(self):
+        try:
+            from src.core.scheduler.schedule_manager import schedule_manager
+
+            schedule_manager.clear_completed_tasks()
+            self.refresh_schedule_tasks()
+        except Exception as e:
+            QMessageBox.warning(self, "失败", f"清理失败：{str(e)}")
+
+    def open_schedule_tasks_dir(self):
+        """打开定时任务目录（tasks.json + 任务图片）。"""
+        try:
+            base_dir = os.path.join(os.path.expanduser("~"), ".xhs_system")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(base_dir))
+        except Exception:
+            pass
     
     def create_model_tab(self):
         """创建模型配置标签页"""
@@ -892,6 +1173,10 @@ class SimpleBackendConfigPage(QWidget):
             self.schedule_enabled.setChecked(schedule_config.get('enabled', False))
             self.interval_hours.setValue(schedule_config.get('interval_hours', 2))
             self.max_posts.setValue(schedule_config.get('max_posts', 10))
+            try:
+                self.refresh_schedule_tasks()
+            except Exception:
+                pass
             
             # 模型配置
             model_config = self.config.get_model_config()

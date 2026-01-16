@@ -169,6 +169,18 @@ class ContentGeneratorThread(QThread):
             keyword=keyword_hint,
         )
 
+        # 可选：注入用户选择的“营销海报素材”（透明 PNG）
+        try:
+            asset_path = str(Config().get_templates_config().get("marketing_poster_asset_path") or "").strip()
+        except Exception:
+            asset_path = ""
+        asset_path = os.path.expanduser(asset_path) if asset_path else ""
+        if asset_path and os.path.exists(asset_path):
+            try:
+                content["asset_image_path"] = asset_path
+            except Exception:
+                pass
+
         # 若模型不可用/失败，则使用默认接口生成的 AI 文案来填充海报
         if str(content.get("__source") or "").strip().lower() != "llm":
             try:

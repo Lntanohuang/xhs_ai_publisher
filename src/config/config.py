@@ -182,6 +182,8 @@ class Config:
                 'selected_cover_template_id': '',
                 # 仅用于展示
                 'selected_cover_template_display': '',
+                # 营销海报：可选素材（建议透明底 PNG）
+                'marketing_poster_asset_path': '',
             },
         )
 

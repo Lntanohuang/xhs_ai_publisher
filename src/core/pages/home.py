@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
 
 import os
 from src.core.alert import TipWindow
+from src.core.pages.scheduled_publish_dialog import ScheduledPublishDialog
 from src.core.processor.content import ContentGeneratorThread
 from src.core.processor.img import ImageProcessorThread
 
@@ -464,6 +465,31 @@ class HomePage(QWidget):
         preview_btn.setEnabled(False)
         preview_layout.addWidget(
             preview_btn, alignment=Qt.AlignCenter)
+
+        # 添加定时发布按钮
+        self.schedule_btn = QPushButton("⏰ 定时发布")
+        self.schedule_btn.setObjectName("schedule_btn")
+        self.schedule_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 15px;
+                font-size: 12pt;
+                background-color: #FF2442;
+                color: white;
+                border: none;
+                border-radius: 15px;
+                margin-top: 8px;
+            }
+            QPushButton:hover {
+                background-color: #E91E63;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.schedule_btn.setToolTip("创建定时发布任务（支持固定内容/跟随热点）")
+        self.schedule_btn.clicked.connect(self.schedule_publish)
+        self.schedule_btn.setEnabled(True)
+        preview_layout.addWidget(self.schedule_btn, alignment=Qt.AlignCenter)
 
         # 初始化时禁用按钮
         self.prev_btn.setEnabled(False)
@@ -943,6 +969,128 @@ class HomePage(QWidget):
 
         except Exception as e:
             TipWindow(self.parent, f"❌ 预览发布失败: {str(e)}").show()
+
+    def schedule_publish(self):
+        """创建定时发布任务（无人值守自动发布）。"""
+        try:
+            # 只允许选择“已登录”的用户（无人值守避免验证码）
+            try:
+                from src.core.services.user_service import user_service
+
+                current_user = user_service.get_current_user()
+                users = [u for u in user_service.list_users(active_only=True) if getattr(u, "is_logged_in", False)]
+            except Exception:
+                users = []
+                current_user = None
+
+            if not users:
+                TipWindow(self.parent, "❌ 没有已登录用户，请先登录后再创建定时任务").show()
+                return
+
+            default_user_id = getattr(current_user, "id", None) if current_user else getattr(users[0], "id", None)
+
+            # 默认重复间隔取后台配置的 interval_hours
+            default_interval_hours = 2
+            try:
+                default_interval_hours = int(self.parent.config.get_schedule_config().get("interval_hours", 2) or 2)
+            except Exception:
+                default_interval_hours = 2
+
+            dialog = ScheduledPublishDialog(
+                self,
+                users=users,
+                default_user_id=default_user_id,
+                default_interval_hours=default_interval_hours,
+                initial_title=(self.title_input.text() or "").strip(),
+                initial_content=(self.subtitle_input.toPlainText() or "").strip(),
+                initial_images=list(getattr(self, "images", None) or []),
+            )
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                return
+
+            user_id = dialog.get_user_id()
+            schedule_time = dialog.get_schedule_time()
+            if not user_id:
+                TipWindow(self.parent, "❌ 请选择发布账号").show()
+                return
+
+            if not hasattr(schedule_time, "isoformat"):
+                TipWindow(self.parent, "❌ 发布时间无效").show()
+                return
+
+            from src.core.scheduler.schedule_manager import schedule_manager
+
+            task_type = dialog.get_task_type()
+
+            if task_type == "hotspot":
+                source = dialog.get_hotspot_source()
+                rank = dialog.get_hotspot_rank()
+                interval_hours = dialog.get_interval_hours()
+                use_ctx = dialog.get_use_hotspot_context()
+
+                # 保存当前选择的封面模板（用于生成图片风格）；若为空则用占位图
+                cover_template_id = ""
+                try:
+                    cover_template_id = str(self.parent.config.get_templates_config().get("selected_cover_template_id") or "").strip()
+                except Exception:
+                    cover_template_id = ""
+
+                task_id = schedule_manager.add_task(
+                    content="",
+                    schedule_time=schedule_time,
+                    title=f"热点({source}) #{rank}",
+                    images=[],
+                    user_id=int(user_id),
+                    task_type="hotspot",
+                    interval_hours=int(interval_hours),
+                    hotspot_source=str(source),
+                    hotspot_rank=int(rank),
+                    use_hotspot_context=bool(use_ctx),
+                    cover_template_id=cover_template_id,
+                    page_count=3,
+                )
+            else:
+                title = dialog.get_fixed_title()
+                content = dialog.get_fixed_content()
+                images = dialog.get_fixed_images()
+
+                if not title and not content:
+                    TipWindow(self.parent, "❌ 请输入标题或正文").show()
+                    return
+
+                cover_template_id = ""
+                try:
+                    cover_template_id = str(self.parent.config.get_templates_config().get("selected_cover_template_id") or "").strip()
+                except Exception:
+                    cover_template_id = ""
+
+                task_id = schedule_manager.add_task(
+                    content=content,
+                    schedule_time=schedule_time,
+                    title=title,
+                    images=images,
+                    user_id=int(user_id),
+                    task_type="fixed",
+                    cover_template_id=cover_template_id,
+                    page_count=3,
+                )
+
+            try:
+                ts = schedule_time.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                ts = str(schedule_time)
+
+            TipWindow(self.parent, f"✅ 已创建定时任务：{ts}\n任务ID: {task_id}").show()
+
+            # 若配置页存在任务列表，尽量刷新
+            try:
+                if hasattr(self.parent, "backend_config_page") and hasattr(self.parent.backend_config_page, "refresh_schedule_tasks"):
+                    self.parent.backend_config_page.refresh_schedule_tasks()
+            except Exception:
+                pass
+
+        except Exception as e:
+            TipWindow(self.parent, f"❌ 创建定时任务失败: {str(e)}").show()
 
     def handle_preview_result(self):
         # 恢复预览按钮状态
