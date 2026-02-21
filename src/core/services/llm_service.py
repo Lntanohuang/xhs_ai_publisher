@@ -53,6 +53,33 @@ class LLMService:
     def __init__(self, config: Optional[Config] = None):
         self.config = config or Config()
 
+    @staticmethod
+    def _is_bigmodel_endpoint(endpoint: str) -> bool:
+        s = (endpoint or "").strip().lower()
+        return ("open.bigmodel.cn" in s) or ("bigmodel" in s) or ("zhipu" in s)
+
+    def _load_claude_code_env(self) -> Dict[str, str]:
+        """从 Claude Code 配置读取 env（用于复用本机已有模型密钥/代理配置）。"""
+        try:
+            path = Path(os.path.expanduser("~")) / ".claude" / "settings.json"
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+            env = data.get("env") or {}
+            if not isinstance(env, dict):
+                return {}
+            out: Dict[str, str] = {}
+            for k, v in env.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                val = str(v or "").strip()
+                if val:
+                    out[key] = val
+            return out
+        except Exception:
+            return {}
+
     def _provider_aliases_for_key(self, provider: str) -> List[str]:
         provider = (provider or "").strip()
         if not provider:
@@ -79,6 +106,7 @@ class LLMService:
             return api_key
 
         provider = (model_config.get("provider") or "").strip()
+        provider_lower = provider.lower()
         api_key_name = (model_config.get("api_key_name") or "").strip() or "default"
         if provider and api_key_name:
             key = api_key_manager.get_key(provider, api_key_name)
@@ -90,6 +118,37 @@ class LLMService:
                     return alias_key.strip()
 
         endpoint = (model_config.get("api_endpoint") or "").strip()
+
+        # BigModel（智谱 GLM）常用于 OpenAI-compatible 端点；
+        # 若本机已配置 Claude Code（~/.claude/settings.json），优先复用其中的 token，避免被 OPENAI_API_KEY 干扰。
+        if self._is_bigmodel_endpoint(endpoint) or ("glm" in provider_lower) or ("智谱" in provider):
+            # 1) 明确的 GLM 环境变量
+            key = (
+                os.environ.get("ZHIPUAI_API_KEY", "")
+                or os.environ.get("BIGMODEL_API_KEY", "")
+                or os.environ.get("GLM_API_KEY", "")
+                or ""
+            ).strip()
+            if key:
+                return key
+
+            # 2) Claude Code 配置（如 ANTHROPIC_AUTH_TOKEN）
+            cc_env = self._load_claude_code_env()
+            key = (
+                (cc_env.get("ZHIPUAI_API_KEY") or "").strip()
+                or (cc_env.get("BIGMODEL_API_KEY") or "").strip()
+                or (cc_env.get("GLM_API_KEY") or "").strip()
+                or (cc_env.get("OPENAI_API_KEY") or "").strip()
+                or (cc_env.get("ANTHROPIC_API_KEY") or "").strip()
+                or (cc_env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
+            )
+            if key:
+                return key
+
+            # 3) 兜底：兼容 OpenAI-compatible 的常用变量名
+            key = (os.environ.get("OPENAI_API_KEY", "") or os.environ.get("API_KEY", "") or "").strip()
+            return key
+
         env_key = self._api_key_from_env(provider, endpoint)
         return (env_key or "").strip()
 
@@ -100,7 +159,7 @@ class LLMService:
         endpoint_lower = endpoint.lower()
 
         if "anthropic" in endpoint_lower or "claude" in provider_lower:
-            return os.environ.get("ANTHROPIC_API_KEY", "") or ""
+            return os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "") or ""
         if "openai" in endpoint_lower or "openai" in provider_lower:
             return os.environ.get("OPENAI_API_KEY", "") or ""
         if "dashscope" in endpoint_lower or "qwen" in provider_lower or "通义" in provider or "阿里" in provider:
@@ -866,12 +925,12 @@ class LLMService:
 
         extra_parts: List[str] = []
         if normalized_tags:
-            extra_parts.append("标签：" + " ".join(normalized_tags))
+            extra_parts.append(" ".join([f"#{t}" for t in normalized_tags if t]).strip())
         if call_to_action:
             extra_parts.append(call_to_action)
 
         if extra_parts:
-            content = f"{content}\n\n" + "\n".join([self._remove_emoji(x) for x in extra_parts if self._remove_emoji(x)])
+            content = f"{content}\n\n" + "\n\n".join([self._remove_emoji(x) for x in extra_parts if self._remove_emoji(x)])
 
         return title, content
 

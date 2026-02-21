@@ -191,7 +191,7 @@ class CoverTemplateLibraryTab(QWidget):
             self.template_list.addItem(empty)
             return
 
-        # 默认：不选封面模板，走远程接口生成封面/内容图
+        # 默认：不选封面模板，使用内置/系统模板生成封面与内容图
         default_tpl = {
             "id": "",
             "display": "默认",

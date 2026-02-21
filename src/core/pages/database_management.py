@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTextEdit, QGroupBox, QProgressBar,
                              QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem)
 
-from src.core.ui.qt_font import get_ui_font_family
+from src.core.ui.qt_font import get_mono_font_family, get_ui_font_family
 
 import json
 from datetime import datetime
@@ -113,7 +113,7 @@ class DatabaseManagementPage(QWidget):
         
         self.health_details = QTextEdit()
         self.health_details.setMaximumHeight(200)
-        self.health_details.setFont(QFont("Consolas", 10))
+        self.health_details.setFont(QFont(get_mono_font_family(), 10))
         status_layout.addWidget(self.health_details)
         
         layout.addWidget(status_group)
@@ -175,7 +175,7 @@ class DatabaseManagementPage(QWidget):
         
         self.operation_log = QTextEdit()
         self.operation_log.setMaximumHeight(250)
-        self.operation_log.setFont(QFont("Consolas", 10))
+        self.operation_log.setFont(QFont(get_mono_font_family(), 10))
         repair_layout.addWidget(self.operation_log)
         
         layout.addWidget(repair_group)
@@ -193,7 +193,7 @@ class DatabaseManagementPage(QWidget):
         info_layout = QVBoxLayout(info_group)
         
         self.db_info_display = QTextEdit()
-        self.db_info_display.setFont(QFont("Consolas", 10))
+        self.db_info_display.setFont(QFont(get_mono_font_family(), 10))
         info_layout.addWidget(self.db_info_display)
         
         # 刷新按钮

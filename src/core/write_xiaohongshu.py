@@ -41,7 +41,12 @@ class VerificationCodeHandler(QObject):
     
     @pyqtSlot()
     def _show_dialog(self):
-        code, ok = QInputDialog.getText(None, "验证码", "请输入验证码:", QLineEdit.EchoMode.Normal)
+        code, ok = QInputDialog.getText(
+            None,
+            "验证码",
+            "请输入验证码（如需扫码/滑块等风控验证，可点取消并在浏览器中手动完成登录）:",
+            QLineEdit.EchoMode.Normal,
+        )
         if ok:
             self.code = code
             self.code_received.emit(code)
@@ -62,9 +67,46 @@ class XiaohongshuPoster:
         self.browser_environment = browser_environment
         # 不再在初始化时调用 initialize，而是让调用者显式调用
 
+    @staticmethod
+    def _is_truthy(value, *, default: bool = False) -> bool:
+        """Parse common truthy/falsey values from env/config."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off", ""):
+            return False
+        return default
+
     def _reset_auth_issue(self) -> None:
         self._auth_issue = False
         self._auth_issue_url = None
+
+    async def _is_creator_logged_in(self) -> bool:
+        """Best-effort login check without navigating away from current page."""
+        try:
+            if not self.context:
+                return False
+            req = getattr(self.context, "request", None)
+            if req is None:
+                return False
+            resp = await req.get(
+                "https://creator.xiaohongshu.com/api/galaxy/user/info",
+                timeout=10_000,
+            )
+            status = getattr(resp, "status", None)
+            try:
+                dispose = getattr(resp, "dispose", None)
+                if callable(dispose):
+                    await dispose()
+            except Exception:
+                pass
+            return int(status or 0) == 200
+        except Exception:
+            return False
 
     def _get_user_phone(self) -> str:
         try:
@@ -84,7 +126,14 @@ class XiaohongshuPoster:
 
         deadline = time.time() + max(5, int(timeout_s or 0))
         last_url = ""
+        next_probe_at = 0.0
         while time.time() < deadline:
+            now = time.time()
+            # Throttle API probing to avoid excessive requests while user is scanning/validating.
+            if now >= next_probe_at:
+                next_probe_at = now + 3.0
+                if await self._is_creator_logged_in():
+                    return True
             try:
                 last_url = self.page.url or last_url
                 if "login" not in (last_url or "") and not self._auth_issue:
@@ -99,6 +148,8 @@ class XiaohongshuPoster:
             await self.page.goto("https://creator.xiaohongshu.com/new/home", wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(1.5)
             last_url = self.page.url or last_url
+            if await self._is_creator_logged_in():
+                return True
             if "login" not in (last_url or "") and not self._auth_issue:
                 return True
         except Exception:
@@ -135,10 +186,26 @@ class XiaohongshuPoster:
     def _get_env_value(self, key, default=None):
         env = self.browser_environment
         if env is None:
-            return default
+            return os.getenv(str(key), default)
         if isinstance(env, dict):
-            return env.get(key, default)
-        return getattr(env, key, default)
+            if key in env:
+                return env.get(key, default)
+            # Allow passing extra knobs via .env without changing DB schema/UI.
+            return os.getenv(str(key), default)
+        # SQLAlchemy model: direct field, then extra_config, then real OS env.
+        try:
+            val = getattr(env, key)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+        try:
+            extra = getattr(env, "extra_config", None)
+            if isinstance(extra, dict) and key in extra:
+                return extra.get(key, default)
+        except Exception:
+            pass
+        return os.getenv(str(key), default)
 
     def _get_user_storage_dir(self) -> str:
         home_dir = os.path.expanduser('~')
@@ -517,6 +584,16 @@ class XiaohongshuPoster:
             except Exception:
                 pass
 
+            # 获取用户数据目录（多用户隔离 token/cookies/storage_state）
+            app_dir = self._get_user_storage_dir()
+            os.makedirs(app_dir, exist_ok=True)
+
+            # 设置 token/cookies/storage_state 文件路径
+            self.token_file = os.path.join(app_dir, "xiaohongshu_token.json")
+            self.cookies_file = os.path.join(app_dir, "xiaohongshu_cookies.json")
+            self.storage_state_file = os.path.join(app_dir, "xiaohongshu_storage_state.json")
+            self.token = self._load_token()
+
             # 启动参数：默认尽量接近真实浏览器，避免过多“反常”flags 触发风控/登录异常
             args_mode = str(self._get_env_value("browser_args_mode", "") or "").strip().lower()
             minimal_args = ["--start-maximized"]
@@ -545,6 +622,30 @@ class XiaohongshuPoster:
 
             chosen_args = compat_args if args_mode in ("compat", "legacy") else minimal_args
             print(f"浏览器启动参数模式: {'compat' if chosen_args is compat_args else 'minimal'}")
+
+            # 推荐：使用 persistent context 保存完整浏览器 Profile（cookies + localStorage + IndexedDB...）
+            # 这样只需登录一次，后续可自动复用登录态，减少“每次都要登录”的痛点。
+            use_persistent_context = self._is_truthy(
+                self._get_env_value("XHS_USE_PERSISTENT_CONTEXT", None),
+                default=True,
+            )
+
+            # Persist for login()/debug decisions
+            self._use_persistent_context = use_persistent_context
+
+            chrome_user_data_dir = str(
+                self._get_env_value(
+                    "XHS_CHROME_USER_DATA_DIR",
+                    os.path.join(app_dir, "chrome_user_data"),
+                )
+                or ""
+            ).strip()
+            self._chrome_user_data_dir = chrome_user_data_dir
+            self._managed_chrome_user_data_dir = os.path.join(app_dir, "chrome_user_data")
+
+            chrome_profile_directory = str(self._get_env_value("XHS_CHROME_PROFILE_DIRECTORY", "") or "").strip()
+            if chrome_profile_directory and not any(a.startswith("--profile-directory=") for a in chosen_args):
+                chosen_args = list(chosen_args) + [f"--profile-directory={chrome_profile_directory}"]
 
             launch_args = {
                 'headless': False,
@@ -602,16 +703,50 @@ class XiaohongshuPoster:
             # 最后尝试 Playwright 默认路径
             launch_attempts.append(dict(launch_args))
 
-            last_error = None
-            for attempt in launch_attempts:
-                try:
-                    self.browser = await self.playwright.chromium.launch(**attempt)
-                    break
-                except Exception as e:
-                    last_error = e
-                    continue
+            # 创建新的上下文（应用指纹/地理位置等）
+            context_options = self._build_context_options()
 
-            if not self.browser:
+            # persistent context: 用完整 Profile 目录保存登录态（更稳），默认开启；失败则自动回退到普通模式。
+            if use_persistent_context and chrome_user_data_dir:
+                try:
+                    os.makedirs(chrome_user_data_dir, exist_ok=True)
+                except Exception:
+                    pass
+
+                persistent_error = None
+                for attempt in launch_attempts:
+                    try:
+                        merged = dict(attempt)
+                        merged.update(context_options)
+                        self.context = await self.playwright.chromium.launch_persistent_context(
+                            chrome_user_data_dir,
+                            **merged,
+                        )
+                        self.browser = getattr(self.context, "browser", None)
+                        pages = getattr(self.context, "pages", None) or []
+                        self.page = pages[0] if pages else await self.context.new_page()
+                        print(f"使用 persistent profile: {chrome_user_data_dir}")
+                        break
+                    except Exception as e:
+                        persistent_error = e
+                        continue
+
+                if not self.context:
+                    print(f"persistent profile 启动失败，回退到普通模式: {persistent_error}")
+
+            last_error = None
+            if not self.context:
+                for attempt in launch_attempts:
+                    try:
+                        self.browser = await self.playwright.chromium.launch(**attempt)
+                        break
+                    except Exception as e:
+                        last_error = e
+                        continue
+
+            # 对 persistent context 来说，Playwright 可能不会暴露 Browser 对象（context 仍可正常使用）。
+            # 仅当 browser 和 context 都为空时，才视为启动失败。
+            if not self.browser and not self.context:
                 # 自愈：Playwright 浏览器缺失时尝试自动安装再重试一次（开发/源码运行场景）
                 if self._is_missing_executable_error(last_error) and await self._auto_install_playwright_chromium():
                     executable_path = self._find_playwright_chromium_executable()
@@ -641,32 +776,24 @@ class XiaohongshuPoster:
                         except Exception as e:
                             last_error = e
 
-                if not self.browser:
+                if not self.browser and not self.context:
                     raise last_error
 
-            # 获取用户数据目录（多用户隔离 token/cookies/storage_state）
-            app_dir = self._get_user_storage_dir()
-            os.makedirs(app_dir, exist_ok=True)
+            # 如果已通过 persistent context 初始化，则无需再 new_context
+            if self.context and self.page:
+                loaded_storage_state = False
+            else:
+                loaded_storage_state = False
+                try:
+                    if os.path.exists(self.storage_state_file) and os.path.getsize(self.storage_state_file) > 0:
+                        context_options["storage_state"] = self.storage_state_file
+                        loaded_storage_state = True
+                        print(f"加载 storage_state: {self.storage_state_file}")
+                except Exception:
+                    pass
 
-            # 设置 token/cookies/storage_state 文件路径
-            self.token_file = os.path.join(app_dir, "xiaohongshu_token.json")
-            self.cookies_file = os.path.join(app_dir, "xiaohongshu_cookies.json")
-            self.storage_state_file = os.path.join(app_dir, "xiaohongshu_storage_state.json")
-            self.token = self._load_token()
-
-            # 创建新的上下文（应用指纹/地理位置等）
-            context_options = self._build_context_options()
-            loaded_storage_state = False
-            try:
-                if os.path.exists(self.storage_state_file) and os.path.getsize(self.storage_state_file) > 0:
-                    context_options["storage_state"] = self.storage_state_file
-                    loaded_storage_state = True
-                    print(f"加载 storage_state: {self.storage_state_file}")
-            except Exception:
-                pass
-
-            self.context = await self.browser.new_context(**context_options)
-            self.page = await self.context.new_page()
+                self.context = await self.browser.new_context(**context_options)
+                self.page = await self.context.new_page()
 
             # 页面诊断：仅输出 error/warning，便于定位“选中文件但无预览/无上传”的前端异常
             try:
@@ -830,9 +957,16 @@ class XiaohongshuPoster:
             print("浏览器启动成功！")
             logging.debug("浏览器启动成功！")
 
-            # 如已加载 storage_state，则无需再次 add_cookies，避免用旧 cookies 覆盖更完整的登录态
-            if not loaded_storage_state:
-                await self._load_cookies()
+            # 对 persistent profile：若 storage_state/cookies 已存在，可自动引导一次登录态（无需短信/扫码）
+            if use_persistent_context:
+                try:
+                    await self._maybe_bootstrap_persistent_session()
+                except Exception:
+                    pass
+            else:
+                # 如已加载 storage_state，则无需再次 add_cookies，避免用旧 cookies 覆盖更完整的登录态
+                if not loaded_storage_state:
+                    await self._load_cookies()
 
         except Exception as e:
             print(f"初始化过程中出现错误: {str(e)}")
@@ -900,6 +1034,108 @@ class XiaohongshuPoster:
         except Exception as e:
             logging.debug(f"保存storage_state失败: {str(e)}")
 
+    async def _restore_storage_state_to_context(self, state: dict) -> None:
+        """将 storage_state 写入当前 context（主要用于 persistent profile 的首次引导）。"""
+        if not self.context or not self.page:
+            return
+        if not isinstance(state, dict):
+            return
+
+        cookies = state.get("cookies") if isinstance(state.get("cookies"), list) else []
+        if cookies:
+            try:
+                await self.context.add_cookies(cookies)
+            except Exception as e:
+                logging.debug(f"写入cookies失败: {str(e)}")
+
+        origins = state.get("origins") if isinstance(state.get("origins"), list) else []
+        for o in origins:
+            if not isinstance(o, dict):
+                continue
+            origin = str(o.get("origin") or "").strip()
+            items = o.get("localStorage") if isinstance(o.get("localStorage"), list) else []
+            if not origin or not items:
+                continue
+            try:
+                await self.page.goto(origin, wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                # 即使跳转/超时，也尽量尝试写入 localStorage
+                pass
+            try:
+                await self.page.evaluate(
+                    """(items) => {
+                        try {
+                            for (const it of (items || [])) {
+                                if (!it) continue;
+                                const k = String(it.name || "");
+                                if (!k) continue;
+                                const v = (it.value === undefined || it.value === null) ? "" : String(it.value);
+                                localStorage.setItem(k, v);
+                            }
+                        } catch (e) {}
+                    }""",
+                    items,
+                )
+            except Exception as e:
+                logging.debug(f"写入localStorage失败({origin}): {str(e)}")
+
+    async def _maybe_bootstrap_persistent_session(self) -> bool:
+        """若使用 persistent profile 且未登录，尝试用 storage_state/cookies 文件引导一次登录态。"""
+        try:
+            if not bool(getattr(self, "_use_persistent_context", False)):
+                return False
+            if not self.context or not self.page:
+                return False
+
+            # 已登录则不覆盖
+            try:
+                if await self._is_creator_logged_in():
+                    return False
+            except Exception:
+                pass
+
+            state_path = str(getattr(self, "storage_state_file", "") or "").strip()
+            state = None
+            if state_path and os.path.exists(state_path) and os.path.getsize(state_path) > 0:
+                try:
+                    with open(state_path, "r", encoding="utf-8") as f:
+                        state = json.load(f)
+                except Exception:
+                    state = None
+
+            if isinstance(state, dict):
+                await self._restore_storage_state_to_context(state)
+            else:
+                # 兜底：只有 cookies 文件也尽量恢复一次
+                try:
+                    await self._load_cookies()
+                except Exception:
+                    pass
+
+            # 再探测一次
+            try:
+                await self._warmup_xhs_sso()
+            except Exception:
+                pass
+
+            try:
+                if await self._is_creator_logged_in():
+                    try:
+                        await self._save_cookies()
+                    except Exception:
+                        pass
+                    try:
+                        await self._save_storage_state()
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                pass
+
+            return False
+        except Exception:
+            return False
+
     async def login(self, phone, country_code="+86"):
         """登录小红书"""
         await self.ensure_browser()  # 确保浏览器已初始化
@@ -914,17 +1150,58 @@ class XiaohongshuPoster:
             await asyncio.sleep(1)
         except Exception:
             pass
-        if self.page and ("login" not in (self.page.url or "")) and not self._auth_issue:
+        already_logged_in = False
+        try:
+            if await self._is_creator_logged_in():
+                already_logged_in = True
+            elif self.page and ("login" not in (self.page.url or "")) and not self._auth_issue:
+                already_logged_in = True
+        except Exception:
+            already_logged_in = False
+
+        if already_logged_in:
             print("检测到已登录，跳过登录流程")
             await self._warmup_xhs_sso()
             await self._save_cookies()
             await self._save_storage_state()
             return
 
+        async def maybe_clear_cookies(*, reason: str) -> None:
+            """Avoid wiping a user's real Chrome profile unless explicitly allowed."""
+            if not self.context:
+                return
+
+            # Non-persistent contexts are always app-owned; safe to clear.
+            if not bool(getattr(self, "_use_persistent_context", False)):
+                await self.context.clear_cookies()
+                return
+
+            allow = self._is_truthy(self._get_env_value("XHS_ALLOW_CLEAR_COOKIES", None), default=False)
+            managed_dir = str(getattr(self, "_managed_chrome_user_data_dir", "") or "").strip()
+            current_dir = str(getattr(self, "_chrome_user_data_dir", "") or "").strip()
+
+            is_managed = False
+            if managed_dir and current_dir:
+                try:
+                    managed_abs = os.path.abspath(os.path.expanduser(managed_dir))
+                    current_abs = os.path.abspath(os.path.expanduser(current_dir))
+                    is_managed = os.path.commonpath([managed_abs, current_abs]) == managed_abs
+                except Exception:
+                    is_managed = False
+
+            if is_managed or allow:
+                await self.context.clear_cookies()
+                return
+
+            print(
+                f"检测到使用 persistent profile 且可能为外部 Chrome Profile，跳过 clear_cookies（reason={reason}）。"
+                "如确需清理，请在 .env 设置 XHS_ALLOW_CLEAR_COOKIES=true。"
+            )
+
         # 尝试加载cookies进行登录
         await self.page.goto("https://creator.xiaohongshu.com/login", wait_until="domcontentloaded")
         # 先清除所有cookies
-        await self.context.clear_cookies()
+        await maybe_clear_cookies(reason="cookie_login")
         
         # 重新加载cookies
         await self._load_cookies()
@@ -934,7 +1211,12 @@ class XiaohongshuPoster:
 
         # 检查是否已经登录
         current_url = self.page.url
-        if "login" not in current_url and not self._auth_issue:
+        cookie_login_ok = False
+        try:
+            cookie_login_ok = await self._is_creator_logged_in()
+        except Exception:
+            cookie_login_ok = False
+        if cookie_login_ok or ("login" not in current_url and not self._auth_issue):
             print("使用cookies登录成功")
             self.token = self._load_token()
             await self._warmup_xhs_sso()
@@ -943,7 +1225,7 @@ class XiaohongshuPoster:
             return
         else:
             # 清理无效的cookies
-            await self.context.clear_cookies()
+            await maybe_clear_cookies(reason="cookie_login_failed")
             
         # 如果cookies登录失败，则进行手动登录
         await self.page.goto("https://creator.xiaohongshu.com/login", wait_until="domcontentloaded")
@@ -1031,7 +1313,15 @@ class XiaohongshuPoster:
         # 使用信号机制获取验证码
         verification_code = await self.verification_handler.get_verification_code()
         if not verification_code:
-            raise Exception("未输入验证码，登录已取消")
+            # 允许用户在浏览器中走“扫码/风控”等其它登录路径：不把“取消输入验证码”视为失败。
+            print("未输入验证码，将等待你在浏览器中继续完成登录（扫码/风控验证等）...")
+            ok = await self._wait_until_creator_logged_in(timeout_s=300)
+            if not ok:
+                raise Exception("登录未完成：未输入验证码且未在限定时间内完成手动登录")
+            await self._warmup_xhs_sso()
+            await self._save_cookies()
+            await self._save_storage_state()
+            return
 
         code_selectors = [
             "input[placeholder*='验证码']",
@@ -1757,25 +2047,59 @@ class XiaohongshuPoster:
             # 输入内容
             print("输入内容...")
             try:
-                # 尝试更多可能的内容选择器
+                # 内容编辑器经常变动（TipTap/ProseMirror），优先用更稳定的“占位 data-placeholder + contenteditable”定位。
+                # 参考 xhs-toolkit PR#49/#50 的选择器调整思路，但这里用 Playwright 更适配的写入方式（fill + 键盘兜底）。
                 content_selectors = [
+                    # TipTap/ProseMirror (new editor)
+                    "div[data-placeholder*='请输入正文'] div[contenteditable='true']",
+                    "div[data-placeholder*='正文描述'] div[contenteditable='true']",
+                    "div[data-placeholder*='正文'] div[contenteditable='true']",
+                    "div.tiptap div.ProseMirror[contenteditable='true']",
+                    "div.ProseMirror[contenteditable='true']",
+                    "[role='textbox'][contenteditable='true']",
+                    "[contenteditable='true'][role='textbox']",
+                    # Legacy fallbacks
                     "[contenteditable='true']:nth-child(2)",
                     ".note-content",
                     "[data-placeholder='添加正文']",
-                    "[role='textbox']",
-                    ".DraftEditor-root"
+                    ".DraftEditor-root",
+                    # Empty-state paragraph (click-to-focus fallback)
+                    "div[data-placeholder*='请输入正文'] p.is-editor-empty:first-child",
+                    "p.is-editor-empty:first-child",
                 ]
-                
+
                 content_filled = False
+                last_error = None
                 for selector in content_selectors:
                     try:
                         print(f"尝试内容选择器: {selector}")
-                        await self.page.wait_for_selector(selector, timeout=5000)
-                        await self.page.fill(selector, content)
+                        loc = self.page.locator(selector).first
+                        if await loc.count() <= 0:
+                            continue
+                        await loc.wait_for(state="visible", timeout=8000)
+                        await loc.scroll_into_view_if_needed()
+
+                        # 尝试直接 fill（对 contenteditable 的根节点更可靠）
+                        try:
+                            await loc.fill(content)
+                        except Exception:
+                            # 某些选择器命中的是编辑器内部的 <p>，Playwright 不允许 fill，
+                            # 但点击后用键盘输入可正常触发编辑器的 input 事件。
+                            await loc.click(timeout=5000)
+                            await asyncio.sleep(0.2)
+                            mod = "Meta" if sys.platform == "darwin" else "Control"
+                            try:
+                                await self.page.keyboard.press(f"{mod}+A")
+                                await self.page.keyboard.press("Backspace")
+                            except Exception:
+                                pass
+                            await self.page.keyboard.insert_text(content)
+
                         print(f"内容输入成功，使用选择器: {selector}")
                         content_filled = True
                         break
                     except Exception as e:
+                        last_error = e
                         print(f"内容选择器 {selector} 失败: {e}")
                         continue
                 
@@ -1789,6 +2113,8 @@ class XiaohongshuPoster:
                     except Exception as e:
                         print(f"键盘输入内容失败: {e}")
                         print("无法输入内容")
+                        if last_error:
+                            print(f"内容编辑器定位最后一次错误: {last_error}")
                     
             except Exception as e:
                 print(f"内容输入失败: {e}")
@@ -1800,15 +2126,31 @@ class XiaohongshuPoster:
 
                 # 可能的最终发布按钮选择器（页面结构经常变化，尽量覆盖多种情况）
                 final_publish_selectors = [
-                    "button:has-text('发布')",
-                    "button:has-text('立即发布')",
                     "button:has-text('确认发布')",
+                    "button:has-text('立即发布')",
+                    "button:has-text('发布')",
                     "button:has-text('提交')",
                     ".submit-btn",
                     ".publish-btn",
                     ".publishButton",
                     "[data-testid='publish']",
+                    # xhs-toolkit PR#50 中的 xpath（作为兜底；页面 DOM 变动会导致失效）
+                    "xpath=//*[@id=\"global\"]/div/div[2]/div[2]/div[2]/button[1]",
                 ]
+
+                # 先滚动到底部，避免发布按钮不在视口内导致点击/定位异常
+                try:
+                    for _ in range(6):
+                        await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+
+                initial_url = ""
+                try:
+                    initial_url = self.page.url or ""
+                except Exception:
+                    initial_url = ""
 
                 last_error = None
                 for selector in final_publish_selectors:
@@ -1818,6 +2160,7 @@ class XiaohongshuPoster:
                             continue
 
                         btn = loc.last
+                        await btn.wait_for(state="visible", timeout=8000)
                         await btn.scroll_into_view_if_needed()
 
                         # 有些按钮一开始处于禁用状态，短暂等待其变为可点击
@@ -1829,7 +2172,14 @@ class XiaohongshuPoster:
                                 break
                             await asyncio.sleep(0.5)
 
-                        await btn.click(timeout=8000)
+                        try:
+                            await btn.click(timeout=8000)
+                        except Exception:
+                            # 有些情况下按钮被遮挡/hover层拦截，尝试 JS click / dispatch_event 兜底
+                            try:
+                                await btn.dispatch_event("click")
+                            except Exception:
+                                await btn.evaluate("el => el.click()")
                         print(f"已点击最终发布按钮: {selector}")
                         publish_success = True
                         break
@@ -1844,6 +2194,40 @@ class XiaohongshuPoster:
                         pass
                     raise Exception(f"无法找到最终发布按钮: {last_error}")
 
+                # 处理可能出现的“确认发布/确定”等弹窗（常见于二次确认、风控提示等）
+                confirm_selectors = [
+                    # Dialog-scoped selectors first (safer)
+                    "div[role='dialog'] button:has-text('确认发布')",
+                    "div[role='dialog'] button:has-text('确认')",
+                    "div[role='dialog'] button:has-text('确定')",
+                    ".el-dialog button:has-text('确认发布')",
+                    ".el-dialog button:has-text('确认')",
+                    ".el-dialog button:has-text('确定')",
+                    ".ant-modal button:has-text('确认发布')",
+                    ".ant-modal button:has-text('确认')",
+                    ".ant-modal button:has-text('确定')",
+                    # Global fallback (last resort)
+                    "button:has-text('确认发布')",
+                ]
+                for selector in confirm_selectors:
+                    try:
+                        btn = self.page.locator(selector).last
+                        if await btn.count() <= 0:
+                            continue
+                        await btn.wait_for(state="visible", timeout=3000)
+                        await btn.scroll_into_view_if_needed()
+                        try:
+                            await btn.click(timeout=5000)
+                        except Exception:
+                            try:
+                                await btn.dispatch_event("click")
+                            except Exception:
+                                await btn.evaluate("el => el.click()")
+                        print(f"检测到发布确认弹窗，已点击: {selector}")
+                        break
+                    except Exception:
+                        continue
+
                 # 尝试等待“发布成功/审核中”等提示，或等待页面跳转
                 success_texts = [
                     "发布成功",
@@ -1852,19 +2236,47 @@ class XiaohongshuPoster:
                     "发布中",
                     "已发布",
                 ]
-                for text in success_texts:
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    # 若 401/跳转登录，直接判定失败，避免“误以为发布成功”
                     try:
-                        await self.page.wait_for_selector(f"text={text}", timeout=15000)
-                        print(f"检测到发布状态提示: {text}")
-                        return True
+                        if self._auth_issue or ("login" in (self.page.url or "")):
+                            raise Exception(f"发布过程中登录态异常/跳转登录: {self._auth_issue_url or self.page.url}")
                     except Exception:
-                        continue
+                        raise
+
+                    for text in success_texts:
+                        try:
+                            if await self.page.locator(f"text={text}").first.is_visible():
+                                print(f"检测到发布状态提示: {text}")
+                                return True
+                        except Exception:
+                            pass
+
+                    # 兜底：发布后常会返回主页/列表页；若 URL 发生变化且不再处于发布页，也认为成功
+                    try:
+                        cur_url = self.page.url or ""
+                        if cur_url and cur_url != initial_url:
+                            lowered = cur_url.lower()
+                            if ("publish" not in lowered) and ("/edit" not in lowered) and ("login" not in lowered):
+                                print(f"检测到发布后页面跳转: {cur_url}")
+                                return True
+                    except Exception:
+                        pass
+
+                    await asyncio.sleep(0.5)
 
                 try:
                     await self.page.wait_for_load_state("networkidle", timeout=20000)
                 except Exception:
                     pass
 
+                # 若无法确认结果，仍返回 True，但保留诊断信息供排查（避免无人值守任务“假成功”没有线索）
+                try:
+                    await self._dump_page_debug(tag="publish_not_verified", include_cookies=False)
+                except Exception:
+                    pass
+                print("未能在超时时间内确认发布结果（可能已发布，但页面未给出明显提示）。")
                 return True
 
             print("文章已准备好，请在浏览器中检查并手动点击发布。")
@@ -1886,28 +2298,50 @@ class XiaohongshuPoster:
         Args:
             force: 是否强制关闭浏览器，默认为False
         """
+        if not force:
+            return
+
+        # 逐步 best-effort 关闭，避免其中一步抛错导致后续资源不释放（尤其是 persistent context）。
         try:
-            if force:
+            try:
+                await self._save_cookies()
+            except Exception:
+                pass
+            try:
+                await self._save_storage_state()
+            except Exception:
+                pass
+
+            if self.page:
                 try:
-                    await self._save_cookies()
+                    await self.page.close()
                 except Exception:
                     pass
+
+            if self.context:
                 try:
-                    await self._save_storage_state()
-                except Exception:
-                    pass
-                if self.context:
                     await self.context.close()
-                if self.browser:
+                except Exception:
+                    pass
+
+            if self.browser:
+                try:
                     await self.browser.close()
-                if self.playwright:
+                except Exception:
+                    pass
+
+            if self.playwright:
+                try:
                     await self.playwright.stop()
-                self.playwright = None
-                self.browser = None
-                self.context = None
-                self.page = None
+                except Exception:
+                    pass
         except Exception as e:
             logging.debug(f"关闭浏览器时出错: {str(e)}")
+        finally:
+            self.playwright = None
+            self.browser = None
+            self.context = None
+            self.page = None
 
     async def ensure_browser(self):
         """确保浏览器已初始化"""

@@ -277,8 +277,17 @@ class BrowserThread(QThread):
             raise RuntimeError("发布失败：缺少图片（小红书图文发布需要图片）")
 
         poster = None
+        poster_is_ephemeral = False
         try:
-            poster = XiaohongshuPoster(user_id=(int(user_id) if user_id else None), browser_environment=browser_env)
+            target_uid = int(user_id) if user_id else None
+
+            # 优先复用当前线程已登录的 poster，避免 persistent profile 目录被同时打开导致启动失败。
+            if self.poster and getattr(self.poster, "user_id", None) == target_uid:
+                poster = self.poster
+            else:
+                poster = XiaohongshuPoster(user_id=target_uid, browser_environment=browser_env)
+                poster_is_ephemeral = True
+
             await poster.initialize()
             await poster.post_article(title, content, images, auto_publish=True)
             self.scheduled_task_result.emit(task_id, True, "")
@@ -286,7 +295,7 @@ class BrowserThread(QThread):
             self.scheduled_task_result.emit(task_id, False, str(e))
         finally:
             try:
-                if poster:
+                if poster and poster_is_ephemeral:
                     await poster.close(force=True)
             except Exception:
                 pass
@@ -323,6 +332,7 @@ class BrowserThread(QThread):
                 title=title or content or "标题",
                 content=content or title or "内容",
                 page_count=page_count,
+                bg_image_path=cover_bg,
                 cover_bg_image_path=cover_bg,
             )
             if generated:
@@ -547,6 +557,7 @@ class BrowserThread(QThread):
                     title=generated_title or topic,
                     content=generated_content or topic,
                     page_count=page_count,
+                    bg_image_path=cover_bg,
                     cover_bg_image_path=cover_bg,
                 )
                 if generated:

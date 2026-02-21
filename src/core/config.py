@@ -58,10 +58,22 @@ class XiaohongshuConfig:
                     "input.title"
                 ],
                 "content_input": [
+                    # TipTap/ProseMirror (new editor)
+                    "div[data-placeholder*='请输入正文'] div[contenteditable='true']",
+                    "div[data-placeholder*='正文描述'] div[contenteditable='true']",
+                    "div[data-placeholder*='正文'] div[contenteditable='true']",
+                    "div.tiptap div.ProseMirror[contenteditable='true']",
+                    "div.ProseMirror[contenteditable='true']",
+                    "[role='textbox'][contenteditable='true']",
+                    # Legacy fallbacks
                     "[contenteditable='true']:nth-child(2)",
                     ".note-content",
                     "[data-placeholder='添加正文']",
-                    "[role='textbox']"
+                    "[role='textbox']",
+                    ".DraftEditor-root",
+                    # Empty-state paragraph (click-to-focus fallback)
+                    "div[data-placeholder*='请输入正文'] p.is-editor-empty:first-child",
+                    "p.is-editor-empty:first-child",
                 ]
             }
 

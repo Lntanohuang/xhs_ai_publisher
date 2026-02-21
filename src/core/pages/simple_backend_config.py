@@ -30,6 +30,7 @@ class SimpleBackendConfigPage(QWidget):
     # 提供商端点映射
     PROVIDER_ENDPOINTS = {
         "OpenAI": "https://api.openai.com/v1/chat/completions",
+        "智谱（GLM）": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         "Anthropic（Claude）": "https://api.anthropic.com/v1/messages",
         "阿里云（通义千问）": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         "月之暗面（Kimi）": "https://api.moonshot.cn/v1/chat/completions",
@@ -41,6 +42,7 @@ class SimpleBackendConfigPage(QWidget):
     # 默认模型名称映射
     PROVIDER_MODELS = {
         "OpenAI": "gpt-3.5-turbo",
+        "智谱（GLM）": "glm-4.5-air",
         "Anthropic（Claude）": "claude-3-5-sonnet-20241022",
         "阿里云（通义千问）": "qwen3-72b-instruct",
         "月之暗面（Kimi）": "kimi2-latest",
@@ -553,6 +555,7 @@ class SimpleBackendConfigPage(QWidget):
         self.model_provider.addItems(
             [
                 "OpenAI",
+                "智谱（GLM）",
                 "Anthropic（Claude）",
                 "阿里云（通义千问）",
                 "月之暗面（Kimi）",

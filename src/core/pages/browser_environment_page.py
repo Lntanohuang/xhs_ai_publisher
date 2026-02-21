@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QDialog, QTextEdit, QMessageBox, QTabWidget,
                              QCheckBox, QComboBox, QSpinBox, QLineEdit)
 
-from src.core.ui.qt_font import get_ui_font_family
+from src.core.ui.qt_font import get_mono_font_family, get_ui_font_family
 
 # 导入服务类
 try:
@@ -265,7 +265,7 @@ class BrowserEnvironmentDialog(QDialog):
         layout.addWidget(info_label)
         
         self.json_edit = QTextEdit()
-        self.json_edit.setFont(QFont("Consolas", 12))  # 增大JSON编辑器字体
+        self.json_edit.setFont(QFont(get_mono_font_family(), 12))  # 增大JSON编辑器字体
         layout.addWidget(self.json_edit)
         
         sync_layout = QHBoxLayout()

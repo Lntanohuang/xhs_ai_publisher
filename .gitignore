@@ -10,6 +10,7 @@ dist/
 output/
 build/dist/
 build/output/
+node_modules/
 xiaohongshu_cookies.json
 .vscode/
 ai_publish_google_shop/

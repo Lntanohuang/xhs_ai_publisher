@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 import random
 import re
@@ -443,6 +444,63 @@ class SystemImageTemplateService:
         return canvas
 
     @staticmethod
+    def _create_builtin_background(
+        size: Tuple[int, int],
+        *,
+        seed_text: str,
+        variant: int = 0,
+    ) -> Tuple[Image.Image, Tuple[int, int, int]]:
+        """生成一个内置的“干净渐变”背景（无外部模板时兜底使用）。"""
+        w, h = size
+        seed_src = (seed_text or "").strip() or "xhs"
+        base_seed = int(hashlib.md5(seed_src.encode("utf-8", errors="ignore")).hexdigest()[:8], 16)
+        rng_seed = base_seed + int(variant or 0) * 97
+        rng = random.Random(rng_seed)
+
+        themes = [
+            # (top, bottom, accent)
+            ((245, 250, 255), (236, 245, 255), (59, 130, 246)),   # blue
+            ((246, 255, 252), (236, 253, 245), (16, 185, 129)),   # green
+            ((255, 248, 250), (255, 236, 239), (236, 72, 153)),   # pink
+            ((255, 250, 240), (255, 243, 230), (245, 158, 11)),   # orange
+            ((248, 247, 255), (240, 236, 255), (139, 92, 246)),   # purple
+            ((250, 250, 250), (245, 245, 245), (79, 70, 229)),    # neutral/indigo
+        ]
+        top, bottom, accent = themes[base_seed % len(themes)]
+
+        # 轻微扰动颜色，避免每次都一模一样
+        def _jitter(c: Tuple[int, int, int], j: int = 10) -> Tuple[int, int, int]:
+            return tuple(max(0, min(255, int(x + rng.randint(-j, j)))) for x in c)
+
+        top = _jitter(top, 8)
+        bottom = _jitter(bottom, 10)
+
+        img = Image.new("RGB", (w, h), color=top)
+        draw = ImageDraw.Draw(img)
+
+        # vertical gradient
+        for y in range(h):
+            t = y / max(1, h - 1)
+            r = int(top[0] * (1 - t) + bottom[0] * t)
+            g = int(top[1] * (1 - t) + bottom[1] * t)
+            b = int(top[2] * (1 - t) + bottom[2] * t)
+            draw.line([(0, y), (w, y)], fill=(r, g, b))
+
+        # soft blobs
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        for _ in range(4):
+            rr = rng.randint(int(min(w, h) * 0.18), int(min(w, h) * 0.36))
+            cx = rng.randint(-rr // 3, w + rr // 3)
+            cy = rng.randint(int(h * 0.05), int(h * 0.85))
+            alpha = rng.randint(18, 36)
+            color = (accent[0], accent[1], accent[2], alpha)
+            od.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), fill=color)
+
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        return img, accent
+
+    @staticmethod
     def _clean_text(text: str) -> str:
         if not text:
             return ""
@@ -503,6 +561,16 @@ class SystemImageTemplateService:
                 parts = [p.strip() for p in raw_tags.split() if p.strip()]
                 tags.extend(parts)
                 continue
+
+            # 兼容直接的 hashtag 行：#话题1 #话题2 ...
+            # 注意：图片分页常用 "# 标题" 作为 Markdown 标题，因此这里排除 "# " 开头的情况
+            if line.startswith("#") and not line.startswith("# "):
+                if line.count("#") >= 2:
+                    raw_tags = line.replace("#", " ")
+                    raw_tags = re.sub(r"[，,、/|]+", " ", raw_tags)
+                    parts = [p.strip() for p in raw_tags.split() if p.strip()]
+                    tags.extend(parts)
+                    continue
 
             kept.append(line)
 
@@ -764,6 +832,771 @@ class SystemImageTemplateService:
             pages.append(chunk.strip())
         return [p for p in pages if p]
 
+    @staticmethod
+    def _split_blocks(text: str) -> List[str]:
+        raw = (text or "").strip()
+        if not raw:
+            return []
+        return [b.strip() for b in re.split(r"\n\s*\n", raw) if b and b.strip()]
+
+    @staticmethod
+    def _strip_md_inline(text: str) -> str:
+        s = str(text or "")
+        s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)  # [text](url) -> text
+        s = re.sub(r"`+", "", s)
+        s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+        s = re.sub(r"__(.+?)__", r"\1", s)
+        s = re.sub(r"~~(.+?)~~", r"\1", s)
+        return s
+
+    @classmethod
+    def _normalize_md_line(cls, line: str) -> str:
+        s = str(line or "").strip()
+        if not s:
+            return ""
+        s = re.sub(r"^>\s*", "", s).strip()
+        # 仅移除「# 」「## 」这类标题写法，不影响「#话题」标签（标签会在 _extract_tags 里处理）
+        s = re.sub(r"^#{1,6}\s+", "", s).strip()
+        s = cls._strip_md_inline(s).strip()
+        return s
+
+    @staticmethod
+    def _strip_list_prefix(line: str, *, keep_number: bool = False) -> str:
+        s = str(line or "").strip()
+        if not s:
+            return ""
+        m = re.match(r"^(\d{1,2})[.)、]\s*(.+)$", s)
+        if m:
+            num = str(m.group(1) or "").strip()
+            rest = str(m.group(2) or "").strip()
+            return f"{num}. {rest}".strip() if keep_number else rest
+        s = re.sub(r"^[-*•]\s+", "", s).strip()
+        return s
+
+    @staticmethod
+    def _looks_like_footer_text(text: str) -> bool:
+        s = (text or "").strip()
+        if not s:
+            return False
+        if len(s) > 220:
+            return False
+        # 避免把“步骤列表”误判为 footer（例如：1. 下单购买 / 2. ...）
+        lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            list_prefix = 0
+            for ln in lines:
+                if re.match(r"^(\d{1,2})[.)、]\s*", ln) or re.match(r"^[-*•]\s+", ln):
+                    list_prefix += 1
+            # 多行“列表块”更可能是正文而不是 footer；直接排除，避免误伤时间线/步骤内容
+            if list_prefix >= 2:
+                return False
+        keywords = [
+            "私信",
+            "咨询",
+            "领取",
+            "获取",
+            "预览",
+            "扫码",
+            "价格",
+            "元",
+            "你会得到",
+            "你会拿到",
+            "你会获得",
+        ]
+        if any(k in s for k in keywords):
+            return True
+        if re.search(r"(?:￥|¥)\s*\d+(?:\.\d{1,2})?", s):
+            return True
+        if re.search(r"\d+(?:\.\d{1,2})?\s*(?:元|块)", s):
+            return True
+        return False
+
+    def _extract_footer_lines(self, blocks: List[str]) -> Tuple[List[str], List[str]]:
+        kept = list(blocks or [])
+        footer_blocks: List[str] = []
+        while kept and len(footer_blocks) < 2:
+            cand = (kept[-1] or "").strip()
+            if not cand:
+                kept.pop()
+                continue
+            if not self._looks_like_footer_text(cand):
+                break
+            footer_blocks.insert(0, cand)
+            kept.pop()
+
+        footer_text = "\n".join([b for b in footer_blocks if str(b or "").strip()]).strip()
+        footer_lines = [ln.strip() for ln in footer_text.splitlines() if ln.strip()]
+        return kept, footer_lines[:2]
+
+    def _parse_cards_layout(self, body: str) -> Tuple[str, List[Tuple[str, str]], List[str]]:
+        blocks = self._split_blocks(body)
+        blocks, footer_lines = self._extract_footer_lines(blocks)
+
+        subtitle = ""
+        if blocks:
+            first = blocks[0]
+            first_lines = [self._strip_list_prefix(self._normalize_md_line(x)) for x in str(first).splitlines()]
+            first_lines = [x for x in first_lines if x]
+            if len(first_lines) == 1 and 10 <= len(first_lines[0]) <= 60:
+                # 若第一段是“副标题”样式，且后面还有内容，则拿来当 subtitle
+                if len(blocks) >= 2:
+                    subtitle = first_lines[0]
+                    blocks = blocks[1:]
+
+        items: List[Tuple[str, str]] = []
+        for blk in blocks:
+            raw_lines = [self._normalize_md_line(x) for x in str(blk).splitlines()]
+            lines = [self._strip_list_prefix(x) for x in raw_lines if x]
+            lines = [x for x in lines if x]
+            if not lines:
+                continue
+
+            if len(lines) >= 2 and len(lines[0]) <= 12:
+                head = lines[0].strip()
+                desc = " ".join([x.strip() for x in lines[1:] if x.strip()]).strip()
+                if head and desc:
+                    items.append((head, desc))
+                continue
+
+            one = " ".join([x.strip() for x in lines if x.strip()]).strip()
+            m = re.match(r"^(.{2,12})[：:]\s*(.+)$", one)
+            if m:
+                head = str(m.group(1) or "").strip()
+                desc = str(m.group(2) or "").strip()
+                if head and desc:
+                    items.append((head, desc))
+
+        return subtitle, items, footer_lines
+
+    def _parse_timeline_layout(self, body: str) -> Tuple[str, List[str], List[str]]:
+        blocks = self._split_blocks(body)
+        blocks, footer_lines = self._extract_footer_lines(blocks)
+
+        lines: List[str] = []
+        for blk in blocks:
+            for ln in str(blk or "").splitlines():
+                s = self._normalize_md_line(ln)
+                if s:
+                    lines.append(s)
+
+        if not lines:
+            return "", [], footer_lines
+
+        number_re = re.compile(r"^(\d{1,2})[.)、]\s*(.+)$")
+        bullet_re = re.compile(r"^[-*•]\s+(.+)$")
+
+        subtitle = ""
+        first = lines[0].strip()
+        first_is_step = bool(number_re.match(first) or bullet_re.match(first))
+        if (not first_is_step) and (("→" in first) or ("->" in first) or ("—" in first) or ("-" in first and " " in first)):
+            subtitle = first
+            lines = lines[1:]
+        elif (not first_is_step) and len(first) <= 46 and len(lines) >= 4:
+            # 兼容「一句引导语 + 步骤列表」
+            subtitle = first
+            lines = lines[1:]
+
+        steps: List[str] = []
+        saw_list_prefix = False
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                continue
+            m = number_re.match(s)
+            if m:
+                saw_list_prefix = True
+                steps.append(str(m.group(2) or "").strip())
+                continue
+            m2 = bullet_re.match(s)
+            if m2:
+                saw_list_prefix = True
+                steps.append(str(m2.group(1) or "").strip())
+                continue
+            steps.append(self._strip_list_prefix(s))
+
+        steps = [x for x in steps if x]
+
+        # 若完全没有列表前缀，且行本身不够短，则不按时间线渲染
+        if not saw_list_prefix:
+            if not (3 <= len(steps) <= 6):
+                return subtitle, [], footer_lines
+            if any(len(x) > 26 for x in steps):
+                return subtitle, [], footer_lines
+
+        return subtitle, steps[:8], footer_lines
+
+    def _render_cards_layout(
+        self,
+        img: Image.Image,
+        *,
+        header: str,
+        subtitle: str,
+        items: Sequence[Tuple[str, str]],
+        footer_lines: Sequence[str],
+        accent: Tuple[int, int, int],
+        dark_bg: bool,
+    ) -> Optional[Image.Image]:
+        items = [(str(a or "").strip(), str(b or "").strip()) for a, b in (items or []) if str(a or "").strip() and str(b or "").strip()]
+        if len(items) < 3:
+            return None
+
+        w, h = img.size
+        header = (header or "").strip() or "要点"
+        subtitle = (subtitle or "").strip()
+        footer_lines = [str(x or "").strip() for x in (footer_lines or []) if str(x or "").strip()][:2]
+
+        draw = ImageDraw.Draw(img)
+
+        outer_x = int(w * 0.10)
+        top_y = int(h * 0.08)
+        bottom_margin = int(h * 0.08)
+
+        # 初始字号（过长会逐步缩小）
+        header_size = max(44, int(h * 0.060))
+        subtitle_size = max(24, int(h * 0.024))
+        card_title_size = max(30, int(h * 0.038))
+        card_desc_size = max(24, int(h * 0.024))
+        footer_main_size = max(26, int(h * 0.028))
+        footer_sub_size = max(22, int(h * 0.021))
+
+        def _measure_layout(
+            hs: int,
+            ss: int,
+            cts: int,
+            cds: int,
+            fms: int,
+            fss: int,
+        ):
+            font_header = font_manager.get_font("chinese", "bold", size=hs)
+            font_subtitle = font_manager.get_font("chinese", "regular", size=ss)
+            font_card_title = font_manager.get_font("chinese", "bold", size=cts)
+            font_card_desc = font_manager.get_font("chinese", "regular", size=cds)
+            font_footer_main = font_manager.get_font("chinese", "bold", size=fms)
+            font_footer_sub = font_manager.get_font("chinese", "regular", size=fss)
+
+            max_w = w - outer_x * 2
+            header_lines = self._smart_wrap(header, draw, font_header, max_w)[:2]
+            header_lh = int(getattr(font_header, "size", hs) * 1.18)
+            header_h = len(header_lines) * header_lh
+
+            subtitle_lines: List[str] = []
+            subtitle_h = 0
+            subtitle_gap = 0
+            if subtitle:
+                subtitle_lines = self._smart_wrap(subtitle, draw, font_subtitle, max_w)[:2]
+                sub_lh = int(getattr(font_subtitle, "size", ss) * 1.36)
+                subtitle_h = len(subtitle_lines) * sub_lh
+                subtitle_gap = int(sub_lh * 0.60)
+
+            header_gap = max(24, int(h * 0.020))
+
+            card_left = outer_x
+            card_right = w - outer_x
+            card_w = max(1, card_right - card_left)
+            pad_x = max(42, int(card_w * 0.055))
+            pad_y = max(26, int(cts * 0.72))
+            title_lh = int(getattr(font_card_title, "size", cts) * 1.16)
+            desc_lh = int(getattr(font_card_desc, "size", cds) * 1.52)
+            title_desc_gap = max(10, int(desc_lh * 0.55))
+            card_gap = max(18, int(h * 0.018))
+
+            max_desc_w = max(1, card_w - pad_x * 2)
+
+            cards = []
+            total_cards_h = 0
+            for title, desc in items[:6]:
+                t = self._strip_md_inline(title).strip()
+                d = self._strip_md_inline(desc).strip()
+                d_lines = self._smart_wrap(d, draw, font_card_desc, max_desc_w)[:2]
+                card_h = pad_y + title_lh + title_desc_gap + len(d_lines) * desc_lh + int(pad_y * 0.90)
+                card_h = max(card_h, int(h * 0.112))
+                cards.append((t, d_lines, card_h))
+                total_cards_h += card_h
+
+            total_cards_h += card_gap * max(0, len(cards) - 1)
+
+            footer_h = 0
+            footer_gap = 0
+            footer_lines_wrapped: List[str] = []
+            footer_sub_wrapped: List[str] = []
+            if footer_lines:
+                footer_gap = max(18, int(h * 0.020))
+                main = footer_lines[0]
+                sub = footer_lines[1] if len(footer_lines) >= 2 else ""
+                footer_lines_wrapped = self._smart_wrap(main, draw, font_footer_main, max_w)[:1]
+                footer_main_lh = int(getattr(font_footer_main, "size", fms) * 1.22)
+                footer_sub_lh = int(getattr(font_footer_sub, "size", fss) * 1.34)
+                if sub:
+                    footer_sub_wrapped = self._smart_wrap(sub, draw, font_footer_sub, max_w)[:2]
+                footer_h = (
+                    max(24, int(h * 0.018))
+                    + len(footer_lines_wrapped) * footer_main_lh
+                    + (int(footer_sub_lh * 0.55) if footer_sub_wrapped else 0)
+                    + len(footer_sub_wrapped) * footer_sub_lh
+                    + max(22, int(h * 0.017))
+                )
+                footer_h = max(footer_h, int(h * 0.10))
+
+            total_h = header_h + subtitle_gap + subtitle_h + header_gap + total_cards_h + footer_gap + footer_h
+
+            return {
+                "fonts": {
+                    "header": font_header,
+                    "subtitle": font_subtitle,
+                    "card_title": font_card_title,
+                    "card_desc": font_card_desc,
+                    "footer_main": font_footer_main,
+                    "footer_sub": font_footer_sub,
+                },
+                "header_lines": header_lines,
+                "header_lh": header_lh,
+                "subtitle_lines": subtitle_lines,
+                "subtitle_lh": int(getattr(font_subtitle, "size", ss) * 1.36) if subtitle_lines else 0,
+                "subtitle_gap": subtitle_gap,
+                "header_gap": header_gap,
+                "card_left": card_left,
+                "card_right": card_right,
+                "card_pad_x": pad_x,
+                "card_pad_y": pad_y,
+                "title_lh": title_lh,
+                "desc_lh": desc_lh,
+                "title_desc_gap": title_desc_gap,
+                "card_gap": card_gap,
+                "cards": cards,
+                "footer_gap": footer_gap,
+                "footer_h": footer_h,
+                "footer_main_wrapped": footer_lines_wrapped,
+                "footer_sub_wrapped": footer_sub_wrapped,
+                "total_h": total_h,
+            }
+
+        layout = None
+        for _ in range(22):
+            layout = _measure_layout(
+                header_size,
+                subtitle_size,
+                card_title_size,
+                card_desc_size,
+                footer_main_size,
+                footer_sub_size,
+            )
+            if top_y + int(layout["total_h"]) <= h - bottom_margin:
+                break
+            # shrink
+            if card_desc_size > 20:
+                card_desc_size = max(20, card_desc_size - 2)
+            if card_title_size > 26:
+                card_title_size = max(26, card_title_size - 2)
+            if header_size > 36:
+                header_size = max(36, header_size - 2)
+            if subtitle_size > 18:
+                subtitle_size = max(18, subtitle_size - 1)
+            if footer_main_size > 22:
+                footer_main_size = max(22, footer_main_size - 1)
+            if footer_sub_size > 18:
+                footer_sub_size = max(18, footer_sub_size - 1)
+        if not layout or top_y + int(layout["total_h"]) > h - bottom_margin:
+            return None
+
+        header_fill = (250, 250, 250) if dark_bg else (20, 20, 20)
+        subtitle_fill = (215, 215, 215) if dark_bg else (120, 120, 120)
+        card_title_fill = (20, 20, 20)
+        card_desc_fill = (95, 95, 95)
+
+        card_bg = (255, 255, 255, 245)
+        shadow_alpha = 34 if not dark_bg else 52
+        border_rgba = (0, 0, 0, 26) if not dark_bg else (255, 255, 255, 22)
+
+        highlight_fill = (255, 234, 168)
+        highlight_border = (235, 212, 140)
+        right_pill_fill = (255, 238, 182)
+
+        # draw cards + shadows on overlay for transparency
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+
+        y = top_y
+        # header and subtitle drawn later on RGB
+        y += len(layout["header_lines"]) * layout["header_lh"]
+        if layout["subtitle_lines"]:
+            y += layout["subtitle_gap"] + len(layout["subtitle_lines"]) * layout["subtitle_lh"]
+        y += layout["header_gap"]
+
+        card_left = int(layout["card_left"])
+        card_right = int(layout["card_right"])
+        pad_x = int(layout["card_pad_x"])
+        pad_y = int(layout["card_pad_y"])
+        radius = max(26, int(card_desc_size * 1.15) + 18)
+
+        card_rects: List[Tuple[int, int, int, int]] = []
+        for _title, _desc_lines, card_h in layout["cards"]:
+            x0, x1 = card_left, card_right
+            y0, y1 = int(y), int(y + card_h)
+            card_rects.append((x0, y0, x1, y1))
+            od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+            od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+            y += card_h + layout["card_gap"]
+
+        footer_rect: Optional[Tuple[int, int, int, int]] = None
+        if layout["footer_h"] > 0:
+            y += max(0, int(layout["footer_gap"]) - int(layout["card_gap"]))
+            x0, x1 = card_left, card_right
+            y0, y1 = int(y), int(y + layout["footer_h"])
+            footer_rect = (x0, y0, x1, y1)
+            od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+            od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        # header
+        y_header = top_y
+        for line in layout["header_lines"]:
+            draw.text((outer_x, y_header), line, fill=header_fill, font=layout["fonts"]["header"])
+            y_header += layout["header_lh"]
+
+        # subtitle
+        if layout["subtitle_lines"]:
+            y_header += layout["subtitle_gap"]
+            for line in layout["subtitle_lines"]:
+                draw.text((outer_x, y_header), line, fill=subtitle_fill, font=layout["fonts"]["subtitle"])
+                y_header += layout["subtitle_lh"]
+
+        # cards content
+        for (title, desc_lines, _card_h), rect in zip(layout["cards"], card_rects):
+            x0, y0, x1, y1 = rect
+
+            # title highlight pill
+            t_font = layout["fonts"]["card_title"]
+            t_bbox = draw.textbbox((0, 0), title, font=t_font)
+            tw = t_bbox[2] - t_bbox[0]
+            th = t_bbox[3] - t_bbox[1]
+            pill_pad_x = max(14, int(th * 0.42))
+            pill_pad_y = max(8, int(th * 0.28))
+            pill_x0 = x0 + pad_x
+            pill_y0 = y0 + pad_y - int(pill_pad_y * 0.2)
+            pill_x1 = min(x1 - pad_x, pill_x0 + tw + pill_pad_x * 2)
+            pill_y1 = pill_y0 + th + pill_pad_y * 2
+            draw.rounded_rectangle(
+                (pill_x0, pill_y0, pill_x1, pill_y1),
+                radius=int((pill_y1 - pill_y0) / 2),
+                fill=highlight_fill,
+                outline=highlight_border,
+                width=2,
+            )
+            draw.text((pill_x0 + pill_pad_x, pill_y0 + pill_pad_y - 2), title, fill=card_title_fill, font=t_font)
+
+            # right decorative pill
+            sp_w = max(80, int((x1 - x0) * 0.12))
+            sp_h = max(28, int(th * 1.05))
+            sp_x1 = x1 - max(26, int(pad_x * 0.55))
+            sp_x0 = sp_x1 - sp_w
+            sp_y0 = y0 + max(22, int(pad_y * 0.55))
+            sp_y1 = sp_y0 + sp_h
+            draw.rounded_rectangle((sp_x0, sp_y0, sp_x1, sp_y1), radius=int(sp_h / 2), fill=right_pill_fill, outline=highlight_border, width=2)
+
+            # desc
+            y_text = pill_y1 + int(layout["title_desc_gap"] * 0.70)
+            d_font = layout["fonts"]["card_desc"]
+            for ln in desc_lines:
+                draw.text((x0 + pad_x, y_text), ln, fill=card_desc_fill, font=d_font)
+                y_text += layout["desc_lh"]
+
+        # footer lines
+        if footer_rect and footer_lines:
+            x0, y0, x1, y1 = footer_rect
+            pad = max(28, int(h * 0.022))
+            y_text = y0 + pad
+            if layout["footer_main_wrapped"]:
+                main = layout["footer_main_wrapped"][0]
+                draw.text((x0 + pad, y_text), main, fill=card_title_fill, font=layout["fonts"]["footer_main"])
+                y_text += int(getattr(layout["fonts"]["footer_main"], "size", footer_main_size) * 1.26)
+            if layout["footer_sub_wrapped"]:
+                y_text += max(8, int(getattr(layout["fonts"]["footer_sub"], "size", footer_sub_size) * 0.35))
+                for ln in layout["footer_sub_wrapped"]:
+                    draw.text((x0 + pad, y_text), ln, fill=card_desc_fill, font=layout["fonts"]["footer_sub"])
+                    y_text += int(getattr(layout["fonts"]["footer_sub"], "size", footer_sub_size) * 1.34)
+
+        return img
+
+    def _render_timeline_layout(
+        self,
+        img: Image.Image,
+        *,
+        header: str,
+        subtitle: str,
+        steps: Sequence[str],
+        footer_lines: Sequence[str],
+        accent: Tuple[int, int, int],
+        dark_bg: bool,
+    ) -> Optional[Image.Image]:
+        steps = [str(x or "").strip() for x in (steps or []) if str(x or "").strip()]
+        if len(steps) < 3:
+            return None
+
+        w, h = img.size
+        header = (header or "").strip() or "步骤"
+        subtitle = (subtitle or "").strip()
+        footer_lines = [str(x or "").strip() for x in (footer_lines or []) if str(x or "").strip()][:2]
+
+        draw = ImageDraw.Draw(img)
+
+        outer_x = int(w * 0.10)
+        top_y = int(h * 0.08)
+        bottom_margin = int(h * 0.08)
+
+        header_size = max(44, int(h * 0.060))
+        subtitle_size = max(24, int(h * 0.024))
+        step_size = max(30, int(h * 0.038))
+        footer_main_size = max(26, int(h * 0.028))
+        footer_sub_size = max(22, int(h * 0.021))
+
+        number_font_scale = 0.62
+
+        def _measure(
+            hs: int,
+            ss: int,
+            st: int,
+            fms: int,
+            fss: int,
+        ):
+            font_header = font_manager.get_font("chinese", "bold", size=hs)
+            font_subtitle = font_manager.get_font("chinese", "regular", size=ss)
+            font_step = font_manager.get_font("chinese", "bold", size=st)
+            font_num = font_manager.get_font("chinese", "bold", size=max(18, int(st * number_font_scale)))
+            font_footer_main = font_manager.get_font("chinese", "bold", size=fms)
+            font_footer_sub = font_manager.get_font("chinese", "regular", size=fss)
+
+            max_w = w - outer_x * 2
+            header_lines = self._smart_wrap(header, draw, font_header, max_w)[:2]
+            header_lh = int(getattr(font_header, "size", hs) * 1.18)
+            header_h = len(header_lines) * header_lh
+
+            subtitle_lines: List[str] = []
+            subtitle_h = 0
+            subtitle_gap = 0
+            subtitle_lh = 0
+            if subtitle:
+                subtitle_lines = self._smart_wrap(subtitle, draw, font_subtitle, max_w)[:2]
+                subtitle_lh = int(getattr(font_subtitle, "size", ss) * 1.36)
+                subtitle_h = len(subtitle_lines) * subtitle_lh
+                subtitle_gap = int(subtitle_lh * 0.55)
+
+            header_gap = max(24, int(h * 0.020))
+
+            footer_h = 0
+            footer_gap = 0
+            footer_main_wrapped: List[str] = []
+            footer_sub_wrapped: List[str] = []
+            if footer_lines:
+                footer_gap = max(18, int(h * 0.020))
+                main = footer_lines[0]
+                sub = footer_lines[1] if len(footer_lines) >= 2 else ""
+                footer_main_wrapped = self._smart_wrap(main, draw, font_footer_main, max_w)[:1]
+                footer_main_lh = int(getattr(font_footer_main, "size", fms) * 1.22)
+                footer_sub_lh = int(getattr(font_footer_sub, "size", fss) * 1.34)
+                if sub:
+                    footer_sub_wrapped = self._smart_wrap(sub, draw, font_footer_sub, max_w)[:2]
+                footer_h = (
+                    max(24, int(h * 0.018))
+                    + len(footer_main_wrapped) * footer_main_lh
+                    + (int(footer_sub_lh * 0.55) if footer_sub_wrapped else 0)
+                    + len(footer_sub_wrapped) * footer_sub_lh
+                    + max(22, int(h * 0.017))
+                )
+                footer_h = max(footer_h, int(h * 0.10))
+
+            # timeline card size
+            card_left = outer_x
+            card_right = w - outer_x
+            card_w = max(1, card_right - card_left)
+
+            pad_x = max(56, int(card_w * 0.070))
+            pad_y = max(44, int(st * 1.05))
+
+            row_h = int(getattr(font_step, "size", st) * 1.75)
+            circle_r = max(18, int(row_h * 0.28))
+
+            max_step_w = max(1, card_w - pad_x * 2 - circle_r * 2 - int(circle_r * 1.25))
+            step_lines: List[List[str]] = []
+            used_h = 0
+            for s in steps[:8]:
+                wrapped = self._smart_wrap(s, draw, font_step, max_step_w)[:2]
+                step_lines.append(wrapped)
+                used_h += max(row_h, len(wrapped) * int(getattr(font_step, "size", st) * 1.18))
+            used_h += max(0, len(step_lines) - 1) * int(row_h * 0.55)
+            card_h = pad_y * 2 + used_h
+            card_h = max(card_h, int(h * 0.36))
+
+            total_h = header_h + subtitle_gap + subtitle_h + header_gap + card_h + footer_gap + footer_h
+            return {
+                "fonts": {
+                    "header": font_header,
+                    "subtitle": font_subtitle,
+                    "step": font_step,
+                    "num": font_num,
+                    "footer_main": font_footer_main,
+                    "footer_sub": font_footer_sub,
+                },
+                "header_lines": header_lines,
+                "header_lh": header_lh,
+                "subtitle_lines": subtitle_lines,
+                "subtitle_lh": subtitle_lh,
+                "subtitle_gap": subtitle_gap,
+                "header_gap": header_gap,
+                "card_left": card_left,
+                "card_right": card_right,
+                "card_pad_x": pad_x,
+                "card_pad_y": pad_y,
+                "row_h": row_h,
+                "circle_r": circle_r,
+                "step_lines": step_lines,
+                "step_gap": int(row_h * 0.55),
+                "footer_gap": footer_gap,
+                "footer_h": footer_h,
+                "footer_main_wrapped": footer_main_wrapped,
+                "footer_sub_wrapped": footer_sub_wrapped,
+                "card_h": card_h,
+                "total_h": total_h,
+            }
+
+        layout = None
+        for _ in range(22):
+            layout = _measure(header_size, subtitle_size, step_size, footer_main_size, footer_sub_size)
+            if top_y + int(layout["total_h"]) <= h - bottom_margin:
+                break
+            # shrink
+            if step_size > 26:
+                step_size = max(26, step_size - 2)
+            if header_size > 36:
+                header_size = max(36, header_size - 2)
+            if subtitle_size > 18:
+                subtitle_size = max(18, subtitle_size - 1)
+            if footer_main_size > 22:
+                footer_main_size = max(22, footer_main_size - 1)
+            if footer_sub_size > 18:
+                footer_sub_size = max(18, footer_sub_size - 1)
+        if not layout or top_y + int(layout["total_h"]) > h - bottom_margin:
+            return None
+
+        header_fill = (250, 250, 250) if dark_bg else (20, 20, 20)
+        subtitle_fill = (215, 215, 215) if dark_bg else (120, 120, 120)
+        step_fill = (20, 20, 20)
+        footer_fill = (95, 95, 95)
+
+        card_bg = (255, 255, 255, 245)
+        shadow_alpha = 34 if not dark_bg else 52
+        border_rgba = (0, 0, 0, 26) if not dark_bg else (255, 255, 255, 22)
+
+        # overlay: card + shadow
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+
+        # header area height (for placement)
+        y = top_y
+        y += len(layout["header_lines"]) * layout["header_lh"]
+        if layout["subtitle_lines"]:
+            y += layout["subtitle_gap"] + len(layout["subtitle_lines"]) * layout["subtitle_lh"]
+        y += layout["header_gap"]
+
+        radius = max(30, int(layout["circle_r"] * 1.35) + 22)
+
+        card_left = int(layout["card_left"])
+        card_right = int(layout["card_right"])
+        card_top = int(y)
+        card_bottom = int(y + layout["card_h"])
+
+        od.rounded_rectangle((card_left + 4, card_top + 7, card_right + 4, card_bottom + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+        od.rounded_rectangle((card_left, card_top, card_right, card_bottom), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+
+        footer_rect: Optional[Tuple[int, int, int, int]] = None
+        if layout["footer_h"] > 0:
+            y_footer = card_bottom + int(layout["footer_gap"])
+            x0, x1 = card_left, card_right
+            y0, y1 = int(y_footer), int(y_footer + layout["footer_h"])
+            footer_rect = (x0, y0, x1, y1)
+            od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+            od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        # header text
+        y_header = top_y
+        for line in layout["header_lines"]:
+            draw.text((outer_x, y_header), line, fill=header_fill, font=layout["fonts"]["header"])
+            y_header += layout["header_lh"]
+        if layout["subtitle_lines"]:
+            y_header += layout["subtitle_gap"]
+            for line in layout["subtitle_lines"]:
+                draw.text((outer_x, y_header), line, fill=subtitle_fill, font=layout["fonts"]["subtitle"])
+                y_header += layout["subtitle_lh"]
+
+        # steps inside card
+        pad_x = int(layout["card_pad_x"])
+        pad_y = int(layout["card_pad_y"])
+        row_h = int(layout["row_h"])
+        gap = int(layout["step_gap"])
+        r = int(layout["circle_r"])
+        cx = card_left + pad_x + r
+
+        # line segments
+        centers: List[int] = []
+        y_step = card_top + pad_y
+        for wrapped in layout["step_lines"]:
+            centers.append(int(y_step + r))
+            block_h = max(row_h, len(wrapped) * int(getattr(layout["fonts"]["step"], "size", step_size) * 1.18))
+            y_step += block_h + gap
+
+        if len(centers) >= 2:
+            line_color = (25, 25, 25) if not dark_bg else (235, 235, 235)
+            line_alpha = 100 if not dark_bg else 120
+            line_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            ld = ImageDraw.Draw(line_overlay)
+            for y0, y1 in zip(centers[:-1], centers[1:]):
+                ld.line([(cx, y0 + r), (cx, y1 - r)], fill=(line_color[0], line_color[1], line_color[2], line_alpha), width=max(4, int(r * 0.24)))
+            img = Image.alpha_composite(img.convert("RGBA"), line_overlay).convert("RGB")
+            draw = ImageDraw.Draw(img)
+
+        y_step = card_top + pad_y
+        step_font = layout["fonts"]["step"]
+        num_font = layout["fonts"]["num"]
+        text_x = cx + r + int(r * 1.25)
+        for i, wrapped in enumerate(layout["step_lines"], start=1):
+            cy = int(y_step + r)
+            # circle
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=accent)
+            num = str(i)
+            nb = draw.textbbox((0, 0), num, font=num_font)
+            nw = nb[2] - nb[0]
+            nh = nb[3] - nb[1]
+            draw.text((cx - nw // 2, cy - nh // 2 - 1), num, fill=(255, 255, 255), font=num_font)
+
+            # step text (top aligned to block)
+            ty = int(y_step - int(r * 0.15))
+            for ln in wrapped:
+                draw.text((text_x, ty), ln, fill=step_fill, font=step_font)
+                ty += int(getattr(step_font, "size", step_size) * 1.18)
+
+            block_h = max(row_h, len(wrapped) * int(getattr(step_font, "size", step_size) * 1.18))
+            y_step += block_h + gap
+
+        # footer text
+        if footer_rect and footer_lines:
+            x0, y0, x1, y1 = footer_rect
+            pad = max(28, int(h * 0.022))
+            y_text = y0 + pad
+            if layout["footer_main_wrapped"]:
+                draw.text((x0 + pad, y_text), layout["footer_main_wrapped"][0], fill=step_fill, font=layout["fonts"]["footer_main"])
+                y_text += int(getattr(layout["fonts"]["footer_main"], "size", footer_main_size) * 1.26)
+            if layout["footer_sub_wrapped"]:
+                y_text += max(8, int(getattr(layout["fonts"]["footer_sub"], "size", footer_sub_size) * 0.35))
+                for ln in layout["footer_sub_wrapped"]:
+                    draw.text((x0 + pad, y_text), ln, fill=footer_fill, font=layout["fonts"]["footer_sub"])
+                    y_text += int(getattr(layout["fonts"]["footer_sub"], "size", footer_sub_size) * 1.34)
+
+        return img
+
     def generate_post_images(
         self,
         title: str,
@@ -800,8 +1633,6 @@ class SystemImageTemplateService:
         # 内容页：只有在未指定 bg_override 时才使用模板包
         if not bg_override:
             pack = self.choose_pack(pack_id or self.get_selected_pack_id())
-            if not pack or not pack.pages:
-                return None
 
         pages = [str(x) for x in (content_pages or []) if str(x).strip()]
         if not pages:
@@ -822,19 +1653,29 @@ class SystemImageTemplateService:
                 pack_tag = str(pack.id or "").strip()
             elif bg_override:
                 pack_tag = f"bg_{bg_override.stem}"
+            elif cover_override:
+                pack_tag = f"bg_{cover_override.stem}"
         except Exception:
             pack_tag = ""
         pack_tag = pack_tag or "tpl"
         pack_tag = re.sub(r"[^a-zA-Z0-9_\\-]+", "_", pack_tag)[:40]
 
-        def _open_bg(path: Path) -> Image.Image:
-            img = Image.open(str(path)).convert("RGB")
-            return self._resize_with_letterbox(img, target_size)
+        builtin_seed_text = f"{(title or '').strip()}|{(content or '').strip()}"
+        builtin_accent: Optional[Tuple[int, int, int]] = None
+
+        def _open_bg(path: Optional[Path], *, variant: int = 0) -> Image.Image:
+            nonlocal builtin_accent
+            if path:
+                img = Image.open(str(path)).convert("RGB")
+                return self._resize_with_letterbox(img, target_size)
+
+            img, accent = self._create_builtin_background(target_size, seed_text=builtin_seed_text, variant=variant)
+            if accent and builtin_accent is None:
+                builtin_accent = accent
+            return img
 
         cover_bg = cover_override if cover_override else (pack.pages[0] if pack else None)
-        if not cover_bg:
-            return None
-        cover_img = _open_bg(cover_bg)
+        cover_img = _open_bg(cover_bg, variant=0)
         cover_draw = ImageDraw.Draw(cover_img)
 
         # Cover: title
@@ -867,10 +1708,13 @@ class SystemImageTemplateService:
         for idx, page_text in enumerate(pages):
             if bg_override:
                 bg_path = bg_override
-            else:
+            elif pack and pack.pages:
                 bg_index = min(idx + 1, len(pack.pages) - 1) if pack and len(pack.pages) > 1 else 0
                 bg_path = pack.pages[bg_index] if pack else cover_bg
-            img = _open_bg(bg_path)
+            else:
+                bg_path = None
+
+            img = _open_bg(bg_path, variant=idx + 1)
             draw = ImageDraw.Draw(img)
             w, h = img.size
 
@@ -904,7 +1748,49 @@ class SystemImageTemplateService:
             stroke_w_body = 1 if dark_bg else 0
             stroke_fill = (10, 10, 10) if dark_bg else (255, 255, 255)
 
-            accent = self._pick_accent_color(img)
+            accent = builtin_accent or self._pick_accent_color(img)
+
+            # 尝试更“远程风格”的内容页：卡片列表 / 时间线（失败则回退到默认排版）
+            page_header = page_title or self._clean_text(title) or "要点"
+            try:
+                tl_subtitle, tl_steps, tl_footer = self._parse_timeline_layout(body)
+                if tl_steps and len(tl_steps) >= 3:
+                    rendered = self._render_timeline_layout(
+                        img,
+                        header=page_header,
+                        subtitle=tl_subtitle,
+                        steps=tl_steps,
+                        footer_lines=tl_footer,
+                        accent=accent,
+                        dark_bg=dark_bg,
+                    )
+                    if rendered:
+                        out_path = output_dir / f"content_tpl_{idx+1}_{pack_tag}_{ts}_{unique}.jpg"
+                        rendered.save(str(out_path), format="JPEG", quality=92)
+                        content_paths.append(str(out_path))
+                        continue
+            except Exception:
+                pass
+
+            try:
+                card_subtitle, card_items, card_footer = self._parse_cards_layout(body)
+                if card_items and len(card_items) >= 3:
+                    rendered = self._render_cards_layout(
+                        img,
+                        header=page_header,
+                        subtitle=card_subtitle,
+                        items=card_items,
+                        footer_lines=card_footer,
+                        accent=accent,
+                        dark_bg=dark_bg,
+                    )
+                    if rendered:
+                        out_path = output_dir / f"content_tpl_{idx+1}_{pack_tag}_{ts}_{unique}.jpg"
+                        rendered.save(str(out_path), format="JPEG", quality=92)
+                        content_paths.append(str(out_path))
+                        continue
+            except Exception:
+                pass
 
             # 根据正文长度给一个更合理的初始字号，再用 fit-to-box 微调
             plain_len = len(re.sub(r"\s+", "", body or ""))
@@ -932,6 +1818,54 @@ class SystemImageTemplateService:
                 title_line_h = int(getattr(font_title, "size", size_title) * 1.22)
 
                 # 正文分段 + 换行：尽量呈现“小红书”常见的段落节奏
+                # 额外做一层 Markdown 清理，避免出现「##」「-」「**加粗**」等符号导致排版变丑
+                list_bullet_re = re.compile(r"^[-*•]\s+")
+                list_number_re = re.compile(r"^(\d{1,2})[.)、]\s*")
+                md_heading_re = re.compile(r"^#{1,6}\s+")
+                md_quote_re = re.compile(r"^>\s*")
+                md_link_re = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+
+                def _strip_md_inline(text: str) -> str:
+                    s = str(text or "")
+                    s = md_link_re.sub(r"\1", s)
+                    s = re.sub(r"`+", "", s)
+                    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+                    s = re.sub(r"__(.+?)__", r"\1", s)
+                    s = re.sub(r"~~(.+?)~~", r"\1", s)
+                    return s
+
+                def _normalize_line(line: str) -> str:
+                    s = str(line or "").strip()
+                    if not s:
+                        return ""
+                    s = md_quote_re.sub("", s).strip()
+                    # 仅移除「# 」「## 」这类标题写法，不影响「#话题」标签
+                    s = md_heading_re.sub("", s).strip()
+                    s = _strip_md_inline(s).strip()
+                    return s
+
+                def _is_list_line(line: str) -> bool:
+                    s = str(line or "").strip()
+                    if not s:
+                        return False
+                    return bool(list_bullet_re.match(s) or list_number_re.match(s))
+
+                def _normalize_list_line(line: str) -> str:
+                    s = str(line or "").strip()
+                    if not s:
+                        return ""
+                    s = md_quote_re.sub("", s).strip()
+                    m = list_number_re.match(s)
+                    if m:
+                        rest = s[m.end() :].strip()
+                        rest = md_heading_re.sub("", rest).strip()
+                        rest = _strip_md_inline(rest).strip()
+                        return f"{m.group(1)}. {rest}".strip()
+                    s = list_bullet_re.sub("", s).strip()
+                    s = md_heading_re.sub("", s).strip()
+                    s = _strip_md_inline(s).strip()
+                    return s
+
                 raw_body = (body or "").strip()
                 blocks: List[str] = []
                 if raw_body:
@@ -950,7 +1884,7 @@ class SystemImageTemplateService:
                     # 兼容「小标题\\n正文」结构：小标题用加粗，正文用常规
                     seg_lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
                     if len(seg_lines) >= 2 and len(seg_lines[0]) <= 12:
-                        sub = seg_lines[0]
+                        sub = _normalize_line(seg_lines[0])
                         # 保留正文的换行节奏（不要直接 join 成一段）
                         body_raw_lines = [ln.rstrip() for ln in block.splitlines()[1:]]
                         paras: List[str] = []
@@ -961,10 +1895,21 @@ class SystemImageTemplateService:
                                     paras.append(" ".join([x.strip() for x in buf if str(x).strip()]).strip())
                                     buf = []
                                 continue
-                            buf.append(str(ln).strip())
+                            if _is_list_line(ln):
+                                if buf:
+                                    paras.append(" ".join([x.strip() for x in buf if str(x).strip()]).strip())
+                                    buf = []
+                                cleaned = _normalize_list_line(ln)
+                                if cleaned:
+                                    paras.append(cleaned)
+                                continue
+
+                            cleaned = _normalize_line(ln)
+                            if cleaned:
+                                buf.append(cleaned)
                         if buf:
                             paras.append(" ".join([x.strip() for x in buf if str(x).strip()]).strip())
-                        sub_lines = self._smart_wrap(sub, draw, font_body_bold, max_text_w)[:2]
+                        sub_lines = self._smart_wrap(sub, draw, font_body_bold, max_text_w)[:2] if sub else []
                         for i, ln in enumerate(sub_lines):
                             body_items.append({"text": ln, "kind": "sub", "para_start": i == 0})
                         if paras:
@@ -977,12 +1922,33 @@ class SystemImageTemplateService:
                                 )
                                 for pj, part in enumerate(parts):
                                     rest_lines = self._smart_wrap(part, draw, font_body, max_text_w)
-                                    for ln in rest_lines:
-                                        body_items.append({"text": ln, "kind": "body", "para_start": False})
+                                    for li, ln in enumerate(rest_lines):
+                                        body_items.append({"text": ln, "kind": "body", "para_start": li == 0})
                                     if (pj < len(parts) - 1) or (pi < len(paras) - 1):
                                         body_items.append({"text": "", "kind": "blank", "para_start": False})
                     else:
-                        para_text = " ".join(seg_lines).strip() if seg_lines else block
+                        # 处理纯列表块：保持每一条独立成段，避免「- A - B - C」挤在一行
+                        if seg_lines and len(seg_lines) >= 2 and all(_is_list_line(x) for x in seg_lines):
+                            for li, raw_ln in enumerate(seg_lines):
+                                cleaned = _normalize_list_line(raw_ln)
+                                if not cleaned:
+                                    continue
+                                part_lines = self._smart_wrap(cleaned, draw, font_body, max_text_w)
+                                for i, ln in enumerate(part_lines):
+                                    body_items.append({"text": ln, "kind": "body", "para_start": i == 0})
+                                if li < len(seg_lines) - 1:
+                                    body_items.append({"text": "", "kind": "blank", "para_start": False})
+                            body_items.append({"text": "", "kind": "blank", "para_start": False})
+                            continue
+
+                        if seg_lines and len(seg_lines) == 1 and _is_list_line(seg_lines[0]):
+                            para_text = _normalize_list_line(seg_lines[0])
+                        else:
+                            seg_norm = [_normalize_line(x) for x in (seg_lines or [])]
+                            para_text = " ".join([x for x in seg_norm if x]).strip() if seg_norm else ""
+                            if not para_text:
+                                para_text = _normalize_line(block)
+
                         para_text = self._auto_paragraphize(para_text)
                         parts = (
                             [p.strip() for p in re.split(r"\n\s*\n", para_text) if p.strip()]
