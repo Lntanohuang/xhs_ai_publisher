@@ -680,9 +680,9 @@ class LLMService:
         # BigModel/GLM requests can be slower; bump minimum timeout to avoid frequent fallback.
         try:
             if self._is_bigmodel_endpoint(endpoint) or ("glm" in provider.lower()) or ("智谱" in provider):
-                timeout = max(timeout, 90.0)
+                timeout = max(timeout, 120.0)
                 # GLM-5 默认会返回较长的 reasoning_content，max_tokens 过小会导致 content 为空
-                max_tokens = max(max_tokens, 2200)
+                max_tokens = max(max_tokens, 3200)
         except Exception:
             pass
 
