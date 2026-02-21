@@ -681,7 +681,16 @@ class LLMService:
         if endpoint.endswith("/v1"):
             return f"{endpoint}/chat/completions"
 
-        # 兜底：如果末尾没有 /v1，假设它是 base_url
+        # 一些 OpenAI-compatible 实现的 base_url 末尾是 /v3、/v4 等（如豆包/GLM），无需再拼 /v1
+        try:
+            parsed = urlparse(endpoint)
+            path = (parsed.path or "").rstrip("/")
+            if re.search(r"/v\\d+$", path):
+                return f"{endpoint}/chat/completions"
+        except Exception:
+            pass
+
+        # 兜底：如果末尾没有 /v1，假设它是 OpenAI 风格 base_url
         return f"{endpoint}/v1/chat/completions"
 
     def _call_openai_compatible(
