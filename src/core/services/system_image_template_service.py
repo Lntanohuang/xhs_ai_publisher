@@ -41,6 +41,13 @@ class SystemImageTemplateService:
         self.config = config or Config()
 
     @staticmethod
+    def _env_bool(name: str, *, default: bool = False) -> bool:
+        val = (os.environ.get(name) or "").strip().lower()
+        if not val:
+            return default
+        return val in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
     def _get_repo_root() -> Path:
         try:
             return Path(__file__).resolve().parents[3]
@@ -571,6 +578,10 @@ class SystemImageTemplateService:
                     parts = [p.strip() for p in raw_tags.split() if p.strip()]
                     tags.extend(parts)
                     continue
+                # 单个 hashtag：#话题（仅在整行看起来像标签时提取）
+                if re.fullmatch(r"#[0-9A-Za-z_\-\u4e00-\u9fff]{2,20}", line):
+                    tags.append(line.lstrip("#").strip())
+                    continue
 
             kept.append(line)
 
@@ -793,8 +804,10 @@ class SystemImageTemplateService:
             return "", ""
 
         first = str(raw_lines[first_idx] or "").lstrip()
-        if first.startswith("#"):
-            page_title = first.lstrip("#").strip()
+        # 仅将「# 标题 / ## 标题」识别为标题；避免把「#话题1 #话题2」当成标题导致出现“标签页”
+        heading_re = re.compile(r"^#{1,6}\s+")
+        if heading_re.match(first):
+            page_title = heading_re.sub("", first).strip()
             body_lines = raw_lines[first_idx + 1 :]
         else:
             page_title = ""
@@ -1035,6 +1048,7 @@ class SystemImageTemplateService:
         footer_lines: Sequence[str],
         accent: Tuple[int, int, int],
         dark_bg: bool,
+        boxed: bool = False,
     ) -> Optional[Image.Image]:
         items = [(str(a or "").strip(), str(b or "").strip()) for a, b in (items or []) if str(a or "").strip() and str(b or "").strip()]
         if len(items) < 3:
@@ -1200,8 +1214,12 @@ class SystemImageTemplateService:
 
         header_fill = (250, 250, 250) if dark_bg else (20, 20, 20)
         subtitle_fill = (215, 215, 215) if dark_bg else (120, 120, 120)
-        card_title_fill = (20, 20, 20)
-        card_desc_fill = (95, 95, 95)
+        if boxed:
+            card_title_fill = (20, 20, 20)
+            card_desc_fill = (95, 95, 95)
+        else:
+            card_title_fill = (250, 250, 250) if dark_bg else (20, 20, 20)
+            card_desc_fill = (230, 230, 230) if dark_bg else (80, 80, 80)
 
         card_bg = (255, 255, 255, 245)
         shadow_alpha = 34 if not dark_bg else 52
@@ -1211,7 +1229,7 @@ class SystemImageTemplateService:
         highlight_border = (235, 212, 140)
         right_pill_fill = (255, 238, 182)
 
-        # draw cards + shadows on overlay for transparency
+        # draw cards + shadows on overlay for transparency（可选）
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
 
@@ -1233,8 +1251,9 @@ class SystemImageTemplateService:
             x0, x1 = card_left, card_right
             y0, y1 = int(y), int(y + card_h)
             card_rects.append((x0, y0, x1, y1))
-            od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
-            od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+            if boxed:
+                od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+                od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
             y += card_h + layout["card_gap"]
 
         footer_rect: Optional[Tuple[int, int, int, int]] = None
@@ -1243,10 +1262,12 @@ class SystemImageTemplateService:
             x0, x1 = card_left, card_right
             y0, y1 = int(y), int(y + layout["footer_h"])
             footer_rect = (x0, y0, x1, y1)
-            od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
-            od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+            if boxed:
+                od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+                od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
 
-        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        if boxed:
+            img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         draw = ImageDraw.Draw(img)
 
         # header
@@ -1329,6 +1350,7 @@ class SystemImageTemplateService:
         footer_lines: Sequence[str],
         accent: Tuple[int, int, int],
         dark_bg: bool,
+        boxed: bool = False,
     ) -> Optional[Image.Image]:
         steps = [str(x or "").strip() for x in (steps or []) if str(x or "").strip()]
         if len(steps) < 3:
@@ -1481,14 +1503,18 @@ class SystemImageTemplateService:
 
         header_fill = (250, 250, 250) if dark_bg else (20, 20, 20)
         subtitle_fill = (215, 215, 215) if dark_bg else (120, 120, 120)
-        step_fill = (20, 20, 20)
-        footer_fill = (95, 95, 95)
+        if boxed:
+            step_fill = (20, 20, 20)
+            footer_fill = (95, 95, 95)
+        else:
+            step_fill = (245, 245, 245) if dark_bg else (20, 20, 20)
+            footer_fill = (225, 225, 225) if dark_bg else (80, 80, 80)
 
         card_bg = (255, 255, 255, 245)
         shadow_alpha = 34 if not dark_bg else 52
         border_rgba = (0, 0, 0, 26) if not dark_bg else (255, 255, 255, 22)
 
-        # overlay: card + shadow
+        # overlay: card + shadow（可选）
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
 
@@ -1506,8 +1532,9 @@ class SystemImageTemplateService:
         card_top = int(y)
         card_bottom = int(y + layout["card_h"])
 
-        od.rounded_rectangle((card_left + 4, card_top + 7, card_right + 4, card_bottom + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
-        od.rounded_rectangle((card_left, card_top, card_right, card_bottom), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+        if boxed:
+            od.rounded_rectangle((card_left + 4, card_top + 7, card_right + 4, card_bottom + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+            od.rounded_rectangle((card_left, card_top, card_right, card_bottom), radius=radius, fill=card_bg, outline=border_rgba, width=2)
 
         footer_rect: Optional[Tuple[int, int, int, int]] = None
         if layout["footer_h"] > 0:
@@ -1515,10 +1542,12 @@ class SystemImageTemplateService:
             x0, x1 = card_left, card_right
             y0, y1 = int(y_footer), int(y_footer + layout["footer_h"])
             footer_rect = (x0, y0, x1, y1)
-            od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
-            od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
+            if boxed:
+                od.rounded_rectangle((x0 + 4, y0 + 7, x1 + 4, y1 + 7), radius=radius, fill=(0, 0, 0, shadow_alpha))
+                od.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=card_bg, outline=border_rgba, width=2)
 
-        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        if boxed:
+            img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         draw = ImageDraw.Draw(img)
 
         # header text
@@ -1609,6 +1638,10 @@ class SystemImageTemplateService:
         cover_bg_image_path: str = "",
     ) -> Optional[Tuple[str, List[str]]]:
         """基于系统模板生成封面 + 内容图（返回本地路径）。"""
+        show_tags = self._env_bool("XHS_IMG_SHOW_TAGS", default=False)
+        show_content_card = self._env_bool("XHS_IMG_SHOW_CONTENT_CARD", default=False)
+        boxed_list_cards = self._env_bool("XHS_IMG_BOXED_LIST_CARDS", default=False)
+
         bg_override: Optional[Path] = None
         cover_override: Optional[Path] = None
         try:
@@ -1725,6 +1758,11 @@ class SystemImageTemplateService:
             # 从正文中提取标签（用于更美观的标签胶囊渲染）
             body, tags = self._extract_tags(body)
             body = self._auto_paragraphize(body)
+            # 只包含标签的页（如“#话题1 #话题2”）直接跳过，避免出现“最后一张标签图”
+            if not (body or "").strip() and not (page_title or "").strip():
+                continue
+            if not show_tags:
+                tags = []
 
             # 安全边距（尽量兼容不同模板，避免贴边/遮挡页码）
             left = int(w * 0.10)
@@ -1763,6 +1801,7 @@ class SystemImageTemplateService:
                         footer_lines=tl_footer,
                         accent=accent,
                         dark_bg=dark_bg,
+                        boxed=boxed_list_cards,
                     )
                     if rendered:
                         out_path = output_dir / f"content_tpl_{idx+1}_{pack_tag}_{ts}_{unique}.jpg"
@@ -1783,6 +1822,7 @@ class SystemImageTemplateService:
                         footer_lines=card_footer,
                         accent=accent,
                         dark_bg=dark_bg,
+                        boxed=boxed_list_cards,
                     )
                     if rendered:
                         out_path = output_dir / f"content_tpl_{idx+1}_{pack_tag}_{ts}_{unique}.jpg"
@@ -2101,42 +2141,43 @@ class SystemImageTemplateService:
             y = top + int(slack * 0.32)
             y_start = y
 
-            # 先绘制一层“内容卡片”底（更像小红书图文卡片）
-            try:
-                card_pad_x = max(26, int(body_size * 1.15))
-                card_pad_y = max(22, int(body_size * 1.10))
-                card_left = max(16, left - card_pad_x)
-                card_right = min(w - 16, w - right + card_pad_x)
-                card_top = max(16, y_start - int(body_size * 1.10))
-                card_bottom = min(h - 16, y_start + int(layout["total_h"]) + int(body_size * 1.20))
+            # 可选：内容卡片底（白色包裹）。默认关闭，避免“包裹感”太重。
+            if show_content_card:
+                try:
+                    card_pad_x = max(26, int(body_size * 1.15))
+                    card_pad_y = max(22, int(body_size * 1.10))
+                    card_left = max(16, left - card_pad_x)
+                    card_right = min(w - 16, w - right + card_pad_x)
+                    card_top = max(16, y_start - int(body_size * 1.10))
+                    card_bottom = min(h - 16, y_start + int(layout["total_h"]) + int(body_size * 1.20))
 
-                radius = max(26, int(body_size * 1.20) + 18)
-                overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-                od = ImageDraw.Draw(overlay)
+                    radius = max(26, int(body_size * 1.20) + 18)
+                    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                    od = ImageDraw.Draw(overlay)
 
-                shadow_alpha = 32 if not dark_bg else 48
-                od.rounded_rectangle(
-                    (card_left + 6, card_top + 8, card_right + 6, card_bottom + 8),
-                    radius=radius,
-                    fill=(0, 0, 0, shadow_alpha),
-                )
+                    shadow_alpha = 32 if not dark_bg else 48
+                    od.rounded_rectangle(
+                        (card_left + 6, card_top + 8, card_right + 6, card_bottom + 8),
+                        radius=radius,
+                        fill=(0, 0, 0, shadow_alpha),
+                    )
 
-                fill_alpha = 212 if not dark_bg else 150
-                fill_color = (255, 255, 255, fill_alpha) if not dark_bg else (18, 18, 18, fill_alpha)
-                border_alpha = 90 if not dark_bg else 120
-                border_color = (accent[0], accent[1], accent[2], border_alpha)
-                od.rounded_rectangle(
-                    (card_left, card_top, card_right, card_bottom),
-                    radius=radius,
-                    fill=fill_color,
-                    outline=border_color,
-                    width=2,
-                )
+                    fill_alpha = 212 if not dark_bg else 150
+                    fill_color = (255, 255, 255, fill_alpha) if not dark_bg else (18, 18, 18, fill_alpha)
+                    border_alpha = 90 if not dark_bg else 120
+                    border_color = (accent[0], accent[1], accent[2], border_alpha)
+                    od.rounded_rectangle(
+                        (card_left, card_top, card_right, card_bottom),
+                        radius=radius,
+                        fill=fill_color,
+                        outline=border_color,
+                        width=2,
+                    )
 
-                img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-                draw = ImageDraw.Draw(img)
-            except Exception:
-                pass
+                    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+                    draw = ImageDraw.Draw(img)
+                except Exception:
+                    pass
 
             # 绘制标题（居中）
             if layout["title_lines"]:

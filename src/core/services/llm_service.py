@@ -685,7 +685,7 @@ class LLMService:
         try:
             parsed = urlparse(endpoint)
             path = (parsed.path or "").rstrip("/")
-            if re.search(r"/v\\d+$", path):
+            if re.search(r"/v\d+$", path):
                 return f"{endpoint}/chat/completions"
         except Exception:
             pass
