@@ -54,6 +54,44 @@ class LLMService:
         self.config = config or Config()
 
     @staticmethod
+    def _env_flag(name: str, *, default: bool = False) -> bool:
+        val = (os.environ.get(name) or "").strip().lower()
+        if not val:
+            return default
+        return val in {"1", "true", "yes", "y", "on"}
+
+    def _apply_env_model_config_overrides(self, model_config: Dict[str, Any]) -> Dict[str, Any]:
+        """用环境变量补全/覆盖模型端点与模型名（OpenAI-compatible）。"""
+        if not isinstance(model_config, dict):
+            return {}
+
+        base_url = (os.environ.get("XHS_LLM_BASE_URL") or "").strip()
+        model = (os.environ.get("XHS_LLM_MODEL") or "").strip()
+        if not base_url and not model:
+            return model_config
+
+        override = self._env_flag("XHS_LLM_OVERRIDE", default=False)
+        if not override:
+            provider = (model_config.get("provider") or "").strip()
+            endpoint = (model_config.get("api_endpoint") or "").strip()
+            model_name = (model_config.get("model_name") or "").strip()
+
+            looks_default_openai = (
+                (provider in {"OpenAI", "OpenAI GPT-3.5", "OpenAI GPT-4", ""})
+                and (endpoint in {"", "https://api.openai.com/v1/chat/completions"})
+                and (model_name in {"", "gpt-3.5-turbo"})
+            )
+            if not looks_default_openai:
+                return model_config
+
+        updated = dict(model_config)
+        if base_url:
+            updated["api_endpoint"] = base_url
+        if model:
+            updated["model_name"] = model
+        return updated
+
+    @staticmethod
     def _is_bigmodel_endpoint(endpoint: str) -> bool:
         s = (endpoint or "").strip().lower()
         return ("open.bigmodel.cn" in s) or ("bigmodel" in s) or ("zhipu" in s)
@@ -117,6 +155,7 @@ class LLMService:
                 if alias_key:
                     return alias_key.strip()
 
+        model_config = self._apply_env_model_config_overrides(model_config)
         endpoint = (model_config.get("api_endpoint") or "").strip()
 
         # BigModel（智谱 GLM）常用于 OpenAI-compatible 端点；
@@ -132,10 +171,16 @@ class LLMService:
             if key:
                 return key
 
-            # 2) Claude Code 配置（如 ANTHROPIC_AUTH_TOKEN）
+            # 2) 项目级 OpenAI-compatible Key（避免污染全局 OPENAI_API_KEY）
+            key = (os.environ.get("XHS_LLM_API_KEY", "") or "").strip()
+            if key:
+                return key
+
+            # 3) Claude Code 配置（如 ANTHROPIC_AUTH_TOKEN）
             cc_env = self._load_claude_code_env()
             key = (
-                (cc_env.get("ZHIPUAI_API_KEY") or "").strip()
+                (cc_env.get("XHS_LLM_API_KEY") or "").strip()
+                or (cc_env.get("ZHIPUAI_API_KEY") or "").strip()
                 or (cc_env.get("BIGMODEL_API_KEY") or "").strip()
                 or (cc_env.get("GLM_API_KEY") or "").strip()
                 or (cc_env.get("OPENAI_API_KEY") or "").strip()
@@ -145,7 +190,7 @@ class LLMService:
             if key:
                 return key
 
-            # 3) 兜底：兼容 OpenAI-compatible 的常用变量名
+            # 4) 兜底：兼容 OpenAI-compatible 的常用变量名
             key = (os.environ.get("OPENAI_API_KEY", "") or os.environ.get("API_KEY", "") or "").strip()
             return key
 
@@ -161,26 +206,34 @@ class LLMService:
         if "anthropic" in endpoint_lower or "claude" in provider_lower:
             return os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "") or ""
         if "openai" in endpoint_lower or "openai" in provider_lower:
-            return os.environ.get("OPENAI_API_KEY", "") or ""
+            return os.environ.get("XHS_LLM_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "") or ""
         if "dashscope" in endpoint_lower or "qwen" in provider_lower or "通义" in provider or "阿里" in provider:
-            return os.environ.get("DASHSCOPE_API_KEY", "") or ""
+            return os.environ.get("DASHSCOPE_API_KEY", "") or os.environ.get("XHS_LLM_API_KEY", "") or ""
         if "moonshot" in endpoint_lower or "kimi" in provider_lower or "月之暗面" in provider:
-            return os.environ.get("MOONSHOT_API_KEY", "") or ""
+            return os.environ.get("MOONSHOT_API_KEY", "") or os.environ.get("XHS_LLM_API_KEY", "") or ""
         if "volces" in endpoint_lower or "doubao" in provider_lower or "豆包" in provider or "字节" in provider or "火山" in provider:
             return (
                 os.environ.get("ARK_API_KEY", "")
                 or os.environ.get("VOLC_API_KEY", "")
                 or os.environ.get("VOLCENGINE_API_KEY", "")
                 or os.environ.get("DOUBAO_API_KEY", "")
+                or os.environ.get("XHS_LLM_API_KEY", "")
                 or ""
             )
         if "tencent" in endpoint_lower or "hunyuan" in provider_lower or "混元" in provider or "腾讯" in provider or "lkeap" in endpoint_lower:
-            return os.environ.get("TENCENT_API_KEY", "") or os.environ.get("HUNYUAN_API_KEY", "") or os.environ.get("LKEAP_API_KEY", "") or ""
+            return (
+                os.environ.get("TENCENT_API_KEY", "")
+                or os.environ.get("HUNYUAN_API_KEY", "")
+                or os.environ.get("LKEAP_API_KEY", "")
+                or os.environ.get("XHS_LLM_API_KEY", "")
+                or ""
+            )
 
         # 兜底：兼容 OpenAI-compatible 的常用变量名
-        return os.environ.get("OPENAI_API_KEY", "") or os.environ.get("API_KEY", "") or ""
+        return os.environ.get("XHS_LLM_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "") or os.environ.get("API_KEY", "") or ""
 
     def is_model_configured(self, model_config: Dict[str, Any]) -> Tuple[bool, str]:
+        model_config = self._apply_env_model_config_overrides(model_config)
         endpoint = (model_config.get("api_endpoint") or "").strip()
         model_name = (model_config.get("model_name") or "").strip()
         provider = (model_config.get("provider") or "").strip()
@@ -213,7 +266,7 @@ class LLMService:
         except Exception:
             pass
 
-        model_config = self.config.get_model_config()
+        model_config = self._apply_env_model_config_overrides(self.config.get_model_config())
         ok, reason = self.is_model_configured(model_config)
         if not ok:
             raise LLMServiceError(f"模型配置不可用: {reason}")
@@ -257,7 +310,7 @@ class LLMService:
         except Exception:
             pass
 
-        model_config = self.config.get_model_config()
+        model_config = self._apply_env_model_config_overrides(self.config.get_model_config())
         ok, reason = self.is_model_configured(model_config)
         if not ok:
             fallback = self._generate_default_marketing_poster_content(topic, price=price_text, keyword=keyword_text)
