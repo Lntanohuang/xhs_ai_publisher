@@ -1758,9 +1758,19 @@ class SystemImageTemplateService:
             # 从正文中提取标签（用于更美观的标签胶囊渲染）
             body, tags = self._extract_tags(body)
             body = self._auto_paragraphize(body)
-            # 只包含标签的页（如“#话题1 #话题2”）直接跳过，避免出现“最后一张标签图”
+            # 只包含标签的页（如“#话题1 #话题2”或“话题标签”页）直接跳过，避免出现“最后一张标签图”
             if not (body or "").strip() and not (page_title or "").strip():
                 continue
+
+            tag_titles = {"标签", "话题标签", "话题", "hashtags", "hashtag", "tags", "tag"}
+            is_tag_page = (page_title or "").strip().lower() in tag_titles
+            if is_tag_page and not (body or "").strip():
+                if not show_tags or not tags:
+                    continue
+            if (not (body or "").strip()) and tags and (is_tag_page or not (page_title or "").strip()):
+                if not show_tags:
+                    continue
+
             if not show_tags:
                 tags = []
 

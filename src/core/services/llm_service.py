@@ -649,6 +649,7 @@ class LLMService:
 """.strip()
 
     def _call_model(self, model_config: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
+        model_config = self._apply_env_model_config_overrides(model_config)
         endpoint = (model_config.get("api_endpoint") or "").strip()
         provider = (model_config.get("provider") or "").strip()
 
@@ -656,6 +657,34 @@ class LLMService:
         temperature = float(advanced.get("temperature", 0.7))
         max_tokens = int(advanced.get("max_tokens", 1000))
         timeout = float(advanced.get("timeout", 30))
+
+        max_tokens_env = (os.environ.get("XHS_LLM_MAX_TOKENS") or "").strip()
+        if max_tokens_env:
+            try:
+                max_tokens_val = int(float(max_tokens_env))
+                if max_tokens_val > 0:
+                    max_tokens = max_tokens_val
+            except Exception:
+                pass
+
+        # Allow env override for timeout (seconds)
+        timeout_env = (os.environ.get("XHS_LLM_TIMEOUT") or "").strip()
+        if timeout_env:
+            try:
+                timeout_val = float(timeout_env)
+                if timeout_val > 0:
+                    timeout = timeout_val
+            except Exception:
+                pass
+
+        # BigModel/GLM requests can be slower; bump minimum timeout to avoid frequent fallback.
+        try:
+            if self._is_bigmodel_endpoint(endpoint) or ("glm" in provider.lower()) or ("智谱" in provider):
+                timeout = max(timeout, 90.0)
+                # GLM-5 默认会返回较长的 reasoning_content，max_tokens 过小会导致 content 为空
+                max_tokens = max(max_tokens, 2200)
+        except Exception:
+            pass
 
         # Claude / Anthropic
         if provider.startswith("Claude") or endpoint.rstrip("/").endswith("/v1/messages") or "api.anthropic.com" in endpoint:
