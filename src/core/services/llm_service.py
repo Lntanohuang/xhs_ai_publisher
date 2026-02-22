@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -931,6 +932,29 @@ class LLMService:
     def _remove_emoji(text: str) -> str:
         if not text:
             return ""
+        text = str(text)
+        # 归一化一些在中文字体里常见的“方块/叉号”符号
+        try:
+            circled_map = {
+                "\u2139": "※",  # ℹ
+                "\u24EA": "0",  # ⓪
+                "\u24FF": "0",  # ⓿
+                "\u24F5": "1",  # ⓵
+                "\u24F6": "2",
+                "\u24F7": "3",
+                "\u24F8": "4",
+                "\u24F9": "5",
+                "\u24FA": "6",
+                "\u24FB": "7",
+                "\u24FC": "8",
+                "\u24FD": "9",
+                "\u24FE": "10",  # ⓾
+            }
+            for k, v in circled_map.items():
+                if k in text:
+                    text = text.replace(k, v)
+        except Exception:
+            pass
         try:
             emoji_pattern = re.compile(
                 "["
@@ -944,9 +968,33 @@ class LLMService:
                 "]+",
                 flags=re.UNICODE,
             )
-            text = emoji_pattern.sub("", str(text))
+            text = emoji_pattern.sub("", text)
         except Exception:
-            text = str(text)
+            pass
+
+        # 清理 emoji 组合残留（变体选择符、ZWJ、方向控制等），避免出现不可见乱码
+        try:
+            cleaned: List[str] = []
+            for ch in text:
+                if ch in {"\n", "\t"}:
+                    cleaned.append(ch)
+                    continue
+                code = ord(ch)
+                if 0xFE00 <= code <= 0xFE0F:
+                    continue
+                if 0xE0100 <= code <= 0xE01EF:
+                    continue
+                cat = unicodedata.category(ch)
+                if cat == "Cf":
+                    continue
+                if cat.startswith("M"):
+                    continue
+                if cat.startswith("C"):
+                    continue
+                cleaned.append(ch)
+            text = "".join(cleaned)
+        except Exception:
+            pass
         return text.strip()
 
     def _extract_title_content(

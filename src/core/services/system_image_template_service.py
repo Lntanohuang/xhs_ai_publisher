@@ -14,6 +14,7 @@ import random
 import re
 import shutil
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -512,6 +513,36 @@ class SystemImageTemplateService:
         if not text:
             return ""
 
+        text = str(text)
+        # 一些“信息/编号”符号在常见中文字体里会显示为方块（tofu），这里做归一化替换。
+        # 说明：这里尽量用「常见可显示」的符号替代，而不是直接删除。
+        try:
+            circled_map = {
+                "\u2139": "※",  # ℹ INFORMATION SOURCE
+                "\u24EA": "0",  # ⓪
+                "\u24FF": "0",  # ⓿
+                "\u24F5": "1",  # ⓵
+                "\u24F6": "2",
+                "\u24F7": "3",
+                "\u24F8": "4",
+                "\u24F9": "5",
+                "\u24FA": "6",
+                "\u24FB": "7",
+                "\u24FC": "8",
+                "\u24FD": "9",
+                "\u24FE": "10",  # ⓾
+            }
+            for k, v in circled_map.items():
+                if k in text:
+                    text = text.replace(k, v)
+        except Exception:
+            pass
+        # 常见不可见空格（避免出现在图片里像“乱码/方块”）
+        try:
+            text = text.replace("\u00A0", " ")  # nbsp
+        except Exception:
+            pass
+
         # 移除 emoji（尽量不误伤中文）
         try:
             emoji_pattern = re.compile(
@@ -527,6 +558,35 @@ class SystemImageTemplateService:
                 flags=re.UNICODE,
             )
             text = emoji_pattern.sub("", text)
+        except Exception:
+            pass
+
+        # 过滤掉 emoji 组合残留的「变体选择符 / ZWJ」等格式控制字符，避免渲染成方块
+        try:
+            cleaned: List[str] = []
+            for ch in text:
+                if ch in {"\n", "\t"}:
+                    cleaned.append(ch)
+                    continue
+                code = ord(ch)
+                # 变体选择符（常见于 emoji + VS16），会以“方块/乱码”出现
+                if 0xFE00 <= code <= 0xFE0F:
+                    continue
+                # Variation Selectors Supplement
+                if 0xE0100 <= code <= 0xE01EF:
+                    continue
+                cat = unicodedata.category(ch)
+                # Cf: 格式控制（ZWJ/变体选择符/方向控制等），在图片文本中一般不需要
+                if cat == "Cf":
+                    continue
+                # M*: 各类组合附加符号（keycap/重音等），在图片正文中经常造成“方块/乱码”
+                if cat.startswith("M"):
+                    continue
+                # C*: 控制/私用/未分配等字符（保留换行/制表）
+                if cat.startswith("C"):
+                    continue
+                cleaned.append(ch)
+            text = "".join(cleaned)
         except Exception:
             pass
 
@@ -810,8 +870,19 @@ class SystemImageTemplateService:
             page_title = heading_re.sub("", first).strip()
             body_lines = raw_lines[first_idx + 1 :]
         else:
+            # 兼容「#标题/##标题」这种无空格写法（常见于大模型分页输出）。
+            # 仅在该行后面还有正文时，才视为标题；避免把单独的「#话题」页误判为标题页。
             page_title = ""
             body_lines = raw_lines[first_idx:]
+            if first.startswith("#"):
+                m = re.match(r"^(#{1,6})(.*)$", first)
+                if m:
+                    rest = (m.group(2) or "").strip()
+                    has_body = any(str(x or "").strip() for x in raw_lines[first_idx + 1 :])
+                    # 若 rest 内还包含 #，通常是「#话题1 #话题2」这种标签行
+                    if has_body and rest and ("#" not in rest):
+                        page_title = rest
+                        body_lines = raw_lines[first_idx + 1 :]
 
         # 去掉正文前后空行，但保留中间空行
         while body_lines and not str(body_lines[0] or "").strip():
@@ -1667,13 +1738,36 @@ class SystemImageTemplateService:
         if not bg_override:
             pack = self.choose_pack(pack_id or self.get_selected_pack_id())
 
-        pages = [str(x) for x in (content_pages or []) if str(x).strip()]
+        raw_pages = [str(x) for x in (content_pages or []) if str(x).strip()]
+        pages = list(raw_pages)
         if not pages:
             pages = self._split_into_pages(content, count=page_count)
         if not pages:
             pages = [content.strip()] if content.strip() else []
 
         pages = pages[: max(1, int(page_count))]
+
+        # 若用户/模型提供的分页只有标题/标签（导致渲染时被跳过或没有正文），
+        # 则回退用完整正文自动分页，避免出现“只有封面，没有内容页”的情况。
+        if raw_pages and (content or "").strip():
+            try:
+                has_meaningful_body = False
+                for p in pages:
+                    _t, _b = self._parse_page(p)
+                    _b = self._clean_text(_b or p)
+                    _b, _tags = self._extract_tags(_b)
+                    _b = self._auto_paragraphize(_b)
+                    if str(_b or "").strip():
+                        has_meaningful_body = True
+                        break
+
+                if not has_meaningful_body:
+                    fallback_pages = self._split_into_pages(content, count=page_count) or ([content.strip()] if content.strip() else [])
+                    if fallback_pages:
+                        pages = [str(x) for x in fallback_pages if str(x).strip()]
+                        pages = pages[: max(1, int(page_count))]
+            except Exception:
+                pass
 
         output_dir = Path(os.path.expanduser("~")) / ".xhs_system" / "generated_imgs"
         output_dir.mkdir(parents=True, exist_ok=True)

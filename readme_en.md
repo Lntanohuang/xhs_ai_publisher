@@ -58,6 +58,7 @@
 - 🔧 **Custom Models**: Configure OpenAI-compatible / Claude / Ollama endpoints for generation (falls back to built-in methods if not configured)
 - 🧩 **Prompt Templates**: Choose different writing styles via templates (`templates/prompts/*.json`), and extend them easily
 - 📊 **Hotspot Center**: Built-in hot lists (Weibo/Baidu/Toutiao/Bilibili), one-click to use as homepage topic
+- 🔗 **Web Link Import**: Paste a link to import title/content/images (WeChat articles + generic webpages; results depend on the site)
 - 🖼️ **Image Processing**: Smart image matching and processing
 - 🖼️ **Cover/Content Templates**: Choose a template in “🖼️ Cover Center” (including marketing poster/promo banner/product showcase); generation outputs a cover + multiple content images (one-click download)
 - 🏷️ **Tag Recommendations**: Auto-recommend trending tags
@@ -67,6 +68,7 @@
 
 ### 🚀 Automated Publishing
 - 📱 **One-Click Login**: Quick login with phone number
+- 🧩 **Import Login State**: Import Xiaohongshu login state from your system Chrome (useful for SMS/QR risk-control flows)
 - 📋 **Content Preview**: Complete preview before publishing
 - ⏰ **Scheduled Publishing (Unattended)**: Task management + publish at the scheduled time (app must stay running and account must be logged in)
 - 💾 **State Saving**: Auto-save login status
@@ -157,6 +159,7 @@
 - Windows install fails (often PyQt5): use Python 3.11/3.12 (64-bit), avoid Python 3.13 or 32-bit Python
 - Linux browser launch fails: install system deps via `sudo python -m playwright install-deps chromium`
 - `qt.qpa.fonts ... Microsoft YaHei`: harmless Qt warning; the app now auto-selects an available system font
+- Some symbols show as tofu boxes (□/✕): usually your system font lacks that glyph (emoji/circled numbers/info symbols, etc.). Remove such symbols or install a font that supports them (the app also normalizes some characters).
 
 <details>
 <summary>📥 <strong>Method 1: Source Installation (Recommended for Developers)</strong></summary>
@@ -268,18 +271,23 @@ flowchart LR
    - Enter phone number
    - Receive and enter verification code
    - System automatically saves login status
+   - If you hit risk-control / QR login: use “🧩 Import Login State” to import from system Chrome (quit Chrome first to avoid profile lock)
 	
-7. **✍️ Content Creation**
+7. **🔗 Web Link Import (Optional)**
+   - Paste a URL in the homepage “🔗 Import” field
+   - Click “📥 Import” to fetch title/content/images into the draft (results depend on the site)
+
+8. **✍️ Content Creation**
    - Enter creation topic in the input box
    - Click "Generate Content" button
    - AI automatically generates title and content
 	
-8. **🖼️ Image Processing**
+9. **🖼️ Image Processing**
    - System automatically matches relevant images
    - Manually upload custom images
    - Support batch image processing
 	
-9. **👀 Preview & Publish**
+10. **👀 Preview & Publish**
    - Click "Preview Publish" to check content
    - Confirm content and click publish
    - Support scheduled publishing
@@ -293,7 +301,43 @@ flowchart LR
 - Prompt Template: Select from the dropdown; template files live in `templates/prompts/`
 - System image templates: Sidebar “⚙️ Backend Config” → “Templates” can select/import (imports external packs into `~/.xhs_system/system_templates` for cross-platform usage)
 - Cover templates: Sidebar “🖼️ Cover Center” applies a template to the homepage; generated images are cached in `~/.xhs_system/generated_imgs/` and can be downloaded from the homepage
-- Remote workflow: Disabled by default; generation uses your configured model or a built-in fallback
+- Remote workflow: Removed (no remote workflow requests). Generation uses your configured model or a built-in fallback.
+
+### ⚙️ Configure via `.env` (Optional, OpenAI-compatible recommended)
+
+> `.env` is in `.gitignore` and won’t be pushed to GitHub. Never put real keys into `.env.example`.
+
+```bash
+cp .env.example .env
+```
+
+Notes:
+- By default, the UI config (“AI Model”) takes priority; `.env` is only used as a fallback when the UI is not configured.
+- To force `.env`, set `XHS_LLM_OVERRIDE=true`.
+- `XHS_LLM_BASE_URL` can be a base URL (e.g. `.../v1`, `.../api/paas/v4`) or a full `.../chat/completions` URL (the app will normalize it).
+
+Example (Zhipu GLM-5, OpenAI-compatible):
+
+```bash
+XHS_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+XHS_LLM_MODEL=glm-5
+XHS_LLM_API_KEY=your_key
+
+# Optional: force env config (even if the UI is configured)
+XHS_LLM_OVERRIDE=true
+
+# Optional: GLM-5 usually needs larger values
+XHS_LLM_TIMEOUT=120
+XHS_LLM_MAX_TOKENS=3200
+```
+
+Generated image style (optional):
+
+```bash
+XHS_IMG_SHOW_TAGS=false
+XHS_IMG_SHOW_CONTENT_CARD=false
+XHS_IMG_BOXED_LIST_CARDS=false
+```
 
 ## 🔧 Advanced Configuration
 

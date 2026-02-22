@@ -1156,12 +1156,13 @@ class HomePage(QWidget):
 
                 generated = None
                 if bg_path and os.path.exists(bg_path):
+                    # 仅将“封面模板库”背景用于封面；内容页仍使用系统内容模板包，
+                    # 避免用封面背景渲染内容页导致文字不可读/像空白。
                     generated = system_image_template_service.generate_post_images(
                         title=title or "",
                         content=content or "",
                         content_pages=content_pages if isinstance(content_pages, (list, tuple)) else None,
                         page_count=page_count,
-                        bg_image_path=bg_path,
                         cover_bg_image_path=bg_path,
                     )
 
@@ -1175,7 +1176,12 @@ class HomePage(QWidget):
                     )
 
                 if generated:
-                    cover_image_url, content_image_urls = generated
+                    new_cover, new_contents = generated
+                    new_cover = str(new_cover or "").strip()
+                    new_contents = [str(x or "").strip() for x in (new_contents or []) if str(x or "").strip()]
+                    # 避免用“空内容页”覆盖掉已有图片（会导致只剩封面，看起来像内容页空白）
+                    if new_cover and new_contents:
+                        cover_image_url, content_image_urls = new_cover, new_contents
             except Exception as e:
                 print(f"⚠️ 使用封面模板生成封面失败，已回退原封面: {e}")
 
