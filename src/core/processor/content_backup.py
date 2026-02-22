@@ -138,19 +138,21 @@ class BackupContentGenerator(QThread):
             uniq.append(t)
         uniq = uniq[:10]
 
+        tags_line = " ".join([f"#{t}" for t in uniq]).strip()
+
         content = "\n\n".join(
             [
                 f"关于{topic}，我整理了一个更好上手的思路：",
                 "先看重点：\n" + "\n".join([f"{i+1}. {x}" for i, x in enumerate(tips)]),
                 "你可以这样做：\n" + "\n".join([f"{i+1}. {x}" for i, x in enumerate(actions)]),
-                "话题标签：" + " ".join(uniq),
+                tags_line,
             ]
         ).strip()
 
         pages = [
             f"# 先看重点\n\n" + "\n\n".join(tips),
             f"# 你可以这样做\n\n" + "\n\n".join(actions),
-            f"# 话题标签\n\n" + "话题标签：" + " ".join(uniq),
+            f"# 话题标签\n\n" + tags_line,
         ]
         pages = [p for p in pages if str(p).strip()]
         return content, pages

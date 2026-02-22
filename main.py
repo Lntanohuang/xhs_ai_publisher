@@ -10,18 +10,24 @@ from PyQt5.QtWidgets import (QApplication, QHBoxLayout, QMainWindow,
 from src.config.config import Config
 from src.core.browser import BrowserThread
 from src.core.pages.home import HomePage
-from src.core.pages.setting import SettingsPage
 from src.core.pages.tools import ToolsPage
 from src.core.pages.browser_environment_page import BrowserEnvironmentPage
 from src.core.pages.user_management_page import UserManagementPage
 from src.core.pages.simple_backend_config import BackendConfigPage
 from src.core.pages.cover_center_page import CoverCenterPage
 from src.core.pages.data_center_page import DataCenterPage
+from src.core.alert import TipWindow
 from src.logger.logger import Logger
+from src.core.ui.qt_font import (
+    get_emoji_font_family,
+    get_emoji_font_family_css,
+    get_ui_text_font_family_css,
+    ui_font,
+)
 
 # 设置日志文件路径
 log_path = os.path.expanduser('~/Desktop/xhsai_error.log')
-logging.basicConfig(filename=log_path, level=logging.DEBUG)
+logging.basicConfig(filename=log_path, level=logging.DEBUG, encoding="utf-8")
 
 def load_env_file():
     """加载项目根目录的 .env（不覆盖已有环境变量）。"""
@@ -118,14 +124,14 @@ class XiaohongshuUI(QMainWindow):
                 background-color: #f8f9fa;
             }}
             QLabel {{
-                font-family: {("Menlo" if sys.platform == "darwin" else "Consolas")};
+                font-family: {get_ui_text_font_family_css()};
                 color: #34495e;
                 font-size: 11pt;
                 border: none;
                 background: transparent;
             }}
             QPushButton {{
-                font-family: {("Menlo" if sys.platform == "darwin" else "Consolas")};
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 11pt;
                 font-weight: bold;
                 padding: 6px;
@@ -141,7 +147,7 @@ class XiaohongshuUI(QMainWindow):
                 background-color: #cccccc;
             }}
             QLineEdit, QTextEdit, QComboBox {{
-                font-family: {("Menlo" if sys.platform == "darwin" else "Consolas")};
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 11pt;
                 padding: 4px;
                 background-color: white;
@@ -170,6 +176,7 @@ class XiaohongshuUI(QMainWindow):
                 padding: 15px 0;
                 margin: 5px 0;
                 font-size: 20px;
+                font-family: {get_emoji_font_family_css()};
             }}
             #sidebar QPushButton:hover {{
                 background-color: #34495e;
@@ -183,7 +190,7 @@ class XiaohongshuUI(QMainWindow):
             }}
         """)
 
-        self.setMinimumSize(1200, 700)  # 增大主窗口最小尺寸以适应更宽的表格
+        self.setMinimumSize(1200, 780)  # 增大主窗口最小尺寸，提升纵向显示空间
         self.center()
 
         # 创建主窗口部件
@@ -207,40 +214,57 @@ class XiaohongshuUI(QMainWindow):
         home_btn.setCheckable(True)
         home_btn.setChecked(True)
         home_btn.clicked.connect(lambda: self.switch_page(0))
+        home_btn.setToolTip("主页")
 
         # 添加用户管理按钮
         user_btn = QPushButton("👥")
         user_btn.setCheckable(True)
         user_btn.clicked.connect(lambda: self.switch_page(1))
+        user_btn.setToolTip("用户管理")
 
         # 添加浏览器环境按钮
         browser_env_btn = QPushButton("🌐")
         browser_env_btn.setCheckable(True)
         browser_env_btn.clicked.connect(lambda: self.switch_page(2))
+        browser_env_btn.setToolTip("浏览器环境")
 
         # 添加后台配置按钮
         backend_btn = QPushButton("⚙️")
         backend_btn.setCheckable(True)
         backend_btn.clicked.connect(lambda: self.switch_page(3))
+        backend_btn.setToolTip("后台配置")
 
         # 添加封面生成按钮
         cover_btn = QPushButton("🖼️")
         cover_btn.setCheckable(True)
         cover_btn.clicked.connect(lambda: self.switch_page(4))
+        cover_btn.setToolTip("封面中心")
 
         # 数据中心
         data_center_btn = QPushButton("📊")
         data_center_btn.setCheckable(True)
         data_center_btn.clicked.connect(lambda: self.switch_page(5))
+        data_center_btn.setToolTip("数据中心")
 
         # 添加工具箱按钮
         tools_btn = QPushButton("🧰")
         tools_btn.setCheckable(True)
         tools_btn.clicked.connect(lambda: self.switch_page(6))
+        tools_btn.setToolTip("工具箱")
 
-        settings_btn = QPushButton("⚙️")
-        settings_btn.setCheckable(True)
-        settings_btn.clicked.connect(lambda: self.switch_page(7))
+        emoji_font = get_emoji_font_family()
+        if emoji_font:
+            sidebar_font_css = f"font-family: '{emoji_font}';"
+            for btn in [
+                home_btn,
+                user_btn,
+                browser_env_btn,
+                backend_btn,
+                cover_btn,
+                data_center_btn,
+                tools_btn,
+            ]:
+                btn.setStyleSheet(sidebar_font_css)
 
         sidebar_layout.addWidget(home_btn)
         sidebar_layout.addWidget(user_btn)
@@ -249,11 +273,10 @@ class XiaohongshuUI(QMainWindow):
         sidebar_layout.addWidget(cover_btn)
         sidebar_layout.addWidget(data_center_btn)
         sidebar_layout.addWidget(tools_btn)
-        sidebar_layout.addWidget(settings_btn)
         sidebar_layout.addStretch()
 
         # 存储按钮引用以便切换状态
-        self.sidebar_buttons = [home_btn, user_btn, browser_env_btn, backend_btn, cover_btn, data_center_btn, tools_btn, settings_btn]
+        self.sidebar_buttons = [home_btn, user_btn, browser_env_btn, backend_btn, cover_btn, data_center_btn, tools_btn]
 
         # 添加侧边栏到主布局
         main_layout.addWidget(sidebar)
@@ -270,7 +293,6 @@ class XiaohongshuUI(QMainWindow):
         self.cover_page = CoverCenterPage(self)
         self.data_center_page = DataCenterPage(self)
         self.tools_page = ToolsPage(self)
-        self.settings_page = SettingsPage(self)
 
 # 将页面添加到堆叠窗口
         self.stack.addWidget(self.home_page)
@@ -280,7 +302,6 @@ class XiaohongshuUI(QMainWindow):
         self.stack.addWidget(self.cover_page)
         self.stack.addWidget(self.data_center_page)
         self.stack.addWidget(self.tools_page)
-        self.stack.addWidget(self.settings_page)
 
         # 创建浏览器线程
         self.browser_thread = BrowserThread()
@@ -301,6 +322,19 @@ class XiaohongshuUI(QMainWindow):
         
         # 启动定时发布调度器
         from src.core.scheduler.schedule_manager import schedule_manager
+        self.schedule_manager = schedule_manager
+        try:
+            # 任务到期：派发给浏览器线程执行
+            self.schedule_manager.task_execute_requested.connect(self.enqueue_scheduled_task)
+            # 浏览器线程回传执行结果：更新任务状态（跨线程安全）
+            self.browser_thread.scheduled_task_result.connect(self.schedule_manager.handle_task_result)
+
+            # 可选：提示执行状态
+            self.schedule_manager.task_started.connect(self.on_scheduled_task_started)
+            self.schedule_manager.task_completed.connect(self.on_scheduled_task_completed)
+            self.schedule_manager.task_failed.connect(self.on_scheduled_task_failed)
+        except Exception as e:
+            print(f"⚠️ 定时发布信号连接失败: {e}")
         
         # 启动下载器线程
         self.start_downloader_thread()
@@ -349,6 +383,63 @@ class XiaohongshuUI(QMainWindow):
         if preview_btn:
             preview_btn.setText(text)
             preview_btn.setEnabled(enabled)
+
+    def enqueue_scheduled_task(self, task: object):
+        """接收调度器的到期任务，并加入浏览器线程队列执行。"""
+        try:
+            data = task if isinstance(task, dict) else {}
+            self.browser_thread.action_queue.append(
+                {
+                    "type": "scheduled_publish",
+                    "task_id": data.get("task_id"),
+                    "user_id": data.get("user_id"),
+                    "title": data.get("title"),
+                    "content": data.get("content"),
+                    "images": data.get("images"),
+                    # 热点任务相关字段（用于到点重新生成内容/图片）
+                    "task_type": data.get("task_type"),
+                    "interval_hours": data.get("interval_hours"),
+                    "hotspot_source": data.get("hotspot_source"),
+                    "hotspot_rank": data.get("hotspot_rank"),
+                    "use_hotspot_context": data.get("use_hotspot_context"),
+                    "cover_template_id": data.get("cover_template_id"),
+                    "page_count": data.get("page_count"),
+                    "platform": data.get("platform"),
+                    "engine": data.get("engine"),
+                }
+            )
+        except Exception as e:
+            task_id = ""
+            try:
+                task_id = str((task or {}).get("task_id") or "")
+            except Exception:
+                task_id = ""
+            try:
+                if getattr(self, "schedule_manager", None) and task_id:
+                    self.schedule_manager.handle_task_result(task_id, False, str(e))
+            except Exception:
+                pass
+
+    def on_scheduled_task_started(self, task_id: str):
+        try:
+            TipWindow(self, f"⏰ 定时任务开始执行：{task_id}").show()
+        except Exception:
+            pass
+
+    def on_scheduled_task_completed(self, task_id: str):
+        try:
+            TipWindow(self, f"✅ 定时任务发布成功：{task_id}").show()
+        except Exception:
+            pass
+
+    def on_scheduled_task_failed(self, task_id: str, reason: str):
+        try:
+            msg = f"❌ 定时任务发布失败：{task_id}"
+            if reason:
+                msg += f"\n{reason}"
+            TipWindow(self, msg).show()
+        except Exception:
+            pass
 
     def switch_page(self, index):
         """切换页面"""
@@ -530,6 +621,8 @@ if __name__ == "__main__":
         signal.signal(signal.SIGINT, signal_handler)
 
         app = QApplication(sys.argv)
+        # Prefer a UI font that supports CJK, and let monospace be opt-in per widget.
+        app.setFont(ui_font(12))
 
         # 允许 CTRL+C 中断
         timer = QTimer()

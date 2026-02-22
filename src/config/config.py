@@ -140,6 +140,7 @@ class Config:
         """获取各提供商的默认端点"""
         return {
             'OpenAI': 'https://api.openai.com/v1/chat/completions',
+            '智谱（GLM）': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
             'Anthropic（Claude）': 'https://api.anthropic.com/v1/messages',
             '阿里云（通义千问）': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
             '月之暗面（Kimi）': 'https://api.moonshot.cn/v1/chat/completions',
@@ -182,6 +183,8 @@ class Config:
                 'selected_cover_template_id': '',
                 # 仅用于展示
                 'selected_cover_template_display': '',
+                # 营销海报：可选素材（建议透明底 PNG）
+                'marketing_poster_asset_path': '',
             },
         )
 

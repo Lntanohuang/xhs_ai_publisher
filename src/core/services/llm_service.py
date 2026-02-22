@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -53,6 +54,71 @@ class LLMService:
     def __init__(self, config: Optional[Config] = None):
         self.config = config or Config()
 
+    @staticmethod
+    def _env_flag(name: str, *, default: bool = False) -> bool:
+        val = (os.environ.get(name) or "").strip().lower()
+        if not val:
+            return default
+        return val in {"1", "true", "yes", "y", "on"}
+
+    def _apply_env_model_config_overrides(self, model_config: Dict[str, Any]) -> Dict[str, Any]:
+        """用环境变量补全/覆盖模型端点与模型名（OpenAI-compatible）。"""
+        if not isinstance(model_config, dict):
+            return {}
+
+        base_url = (os.environ.get("XHS_LLM_BASE_URL") or "").strip()
+        model = (os.environ.get("XHS_LLM_MODEL") or "").strip()
+        if not base_url and not model:
+            return model_config
+
+        override = self._env_flag("XHS_LLM_OVERRIDE", default=False)
+        if not override:
+            provider = (model_config.get("provider") or "").strip()
+            endpoint = (model_config.get("api_endpoint") or "").strip()
+            model_name = (model_config.get("model_name") or "").strip()
+
+            looks_default_openai = (
+                (provider in {"OpenAI", "OpenAI GPT-3.5", "OpenAI GPT-4", ""})
+                and (endpoint in {"", "https://api.openai.com/v1/chat/completions"})
+                and (model_name in {"", "gpt-3.5-turbo"})
+            )
+            if not looks_default_openai:
+                return model_config
+
+        updated = dict(model_config)
+        if base_url:
+            updated["api_endpoint"] = base_url
+        if model:
+            updated["model_name"] = model
+        return updated
+
+    @staticmethod
+    def _is_bigmodel_endpoint(endpoint: str) -> bool:
+        s = (endpoint or "").strip().lower()
+        return ("open.bigmodel.cn" in s) or ("bigmodel" in s) or ("zhipu" in s)
+
+    def _load_claude_code_env(self) -> Dict[str, str]:
+        """从 Claude Code 配置读取 env（用于复用本机已有模型密钥/代理配置）。"""
+        try:
+            path = Path(os.path.expanduser("~")) / ".claude" / "settings.json"
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+            env = data.get("env") or {}
+            if not isinstance(env, dict):
+                return {}
+            out: Dict[str, str] = {}
+            for k, v in env.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                val = str(v or "").strip()
+                if val:
+                    out[key] = val
+            return out
+        except Exception:
+            return {}
+
     def _provider_aliases_for_key(self, provider: str) -> List[str]:
         provider = (provider or "").strip()
         if not provider:
@@ -79,6 +145,7 @@ class LLMService:
             return api_key
 
         provider = (model_config.get("provider") or "").strip()
+        provider_lower = provider.lower()
         api_key_name = (model_config.get("api_key_name") or "").strip() or "default"
         if provider and api_key_name:
             key = api_key_manager.get_key(provider, api_key_name)
@@ -89,7 +156,45 @@ class LLMService:
                 if alias_key:
                     return alias_key.strip()
 
+        model_config = self._apply_env_model_config_overrides(model_config)
         endpoint = (model_config.get("api_endpoint") or "").strip()
+
+        # BigModel（智谱 GLM）常用于 OpenAI-compatible 端点；
+        # 若本机已配置 Claude Code（~/.claude/settings.json），优先复用其中的 token，避免被 OPENAI_API_KEY 干扰。
+        if self._is_bigmodel_endpoint(endpoint) or ("glm" in provider_lower) or ("智谱" in provider):
+            # 1) 明确的 GLM 环境变量
+            key = (
+                os.environ.get("ZHIPUAI_API_KEY", "")
+                or os.environ.get("BIGMODEL_API_KEY", "")
+                or os.environ.get("GLM_API_KEY", "")
+                or ""
+            ).strip()
+            if key:
+                return key
+
+            # 2) 项目级 OpenAI-compatible Key（避免污染全局 OPENAI_API_KEY）
+            key = (os.environ.get("XHS_LLM_API_KEY", "") or "").strip()
+            if key:
+                return key
+
+            # 3) Claude Code 配置（如 ANTHROPIC_AUTH_TOKEN）
+            cc_env = self._load_claude_code_env()
+            key = (
+                (cc_env.get("XHS_LLM_API_KEY") or "").strip()
+                or (cc_env.get("ZHIPUAI_API_KEY") or "").strip()
+                or (cc_env.get("BIGMODEL_API_KEY") or "").strip()
+                or (cc_env.get("GLM_API_KEY") or "").strip()
+                or (cc_env.get("OPENAI_API_KEY") or "").strip()
+                or (cc_env.get("ANTHROPIC_API_KEY") or "").strip()
+                or (cc_env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
+            )
+            if key:
+                return key
+
+            # 4) 兜底：兼容 OpenAI-compatible 的常用变量名
+            key = (os.environ.get("OPENAI_API_KEY", "") or os.environ.get("API_KEY", "") or "").strip()
+            return key
+
         env_key = self._api_key_from_env(provider, endpoint)
         return (env_key or "").strip()
 
@@ -100,28 +205,36 @@ class LLMService:
         endpoint_lower = endpoint.lower()
 
         if "anthropic" in endpoint_lower or "claude" in provider_lower:
-            return os.environ.get("ANTHROPIC_API_KEY", "") or ""
+            return os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "") or ""
         if "openai" in endpoint_lower or "openai" in provider_lower:
-            return os.environ.get("OPENAI_API_KEY", "") or ""
+            return os.environ.get("XHS_LLM_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "") or ""
         if "dashscope" in endpoint_lower or "qwen" in provider_lower or "通义" in provider or "阿里" in provider:
-            return os.environ.get("DASHSCOPE_API_KEY", "") or ""
+            return os.environ.get("DASHSCOPE_API_KEY", "") or os.environ.get("XHS_LLM_API_KEY", "") or ""
         if "moonshot" in endpoint_lower or "kimi" in provider_lower or "月之暗面" in provider:
-            return os.environ.get("MOONSHOT_API_KEY", "") or ""
+            return os.environ.get("MOONSHOT_API_KEY", "") or os.environ.get("XHS_LLM_API_KEY", "") or ""
         if "volces" in endpoint_lower or "doubao" in provider_lower or "豆包" in provider or "字节" in provider or "火山" in provider:
             return (
                 os.environ.get("ARK_API_KEY", "")
                 or os.environ.get("VOLC_API_KEY", "")
                 or os.environ.get("VOLCENGINE_API_KEY", "")
                 or os.environ.get("DOUBAO_API_KEY", "")
+                or os.environ.get("XHS_LLM_API_KEY", "")
                 or ""
             )
         if "tencent" in endpoint_lower or "hunyuan" in provider_lower or "混元" in provider or "腾讯" in provider or "lkeap" in endpoint_lower:
-            return os.environ.get("TENCENT_API_KEY", "") or os.environ.get("HUNYUAN_API_KEY", "") or os.environ.get("LKEAP_API_KEY", "") or ""
+            return (
+                os.environ.get("TENCENT_API_KEY", "")
+                or os.environ.get("HUNYUAN_API_KEY", "")
+                or os.environ.get("LKEAP_API_KEY", "")
+                or os.environ.get("XHS_LLM_API_KEY", "")
+                or ""
+            )
 
         # 兜底：兼容 OpenAI-compatible 的常用变量名
-        return os.environ.get("OPENAI_API_KEY", "") or os.environ.get("API_KEY", "") or ""
+        return os.environ.get("XHS_LLM_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "") or os.environ.get("API_KEY", "") or ""
 
     def is_model_configured(self, model_config: Dict[str, Any]) -> Tuple[bool, str]:
+        model_config = self._apply_env_model_config_overrides(model_config)
         endpoint = (model_config.get("api_endpoint") or "").strip()
         model_name = (model_config.get("model_name") or "").strip()
         provider = (model_config.get("provider") or "").strip()
@@ -154,7 +267,7 @@ class LLMService:
         except Exception:
             pass
 
-        model_config = self.config.get_model_config()
+        model_config = self._apply_env_model_config_overrides(self.config.get_model_config())
         ok, reason = self.is_model_configured(model_config)
         if not ok:
             raise LLMServiceError(f"模型配置不可用: {reason}")
@@ -198,7 +311,7 @@ class LLMService:
         except Exception:
             pass
 
-        model_config = self.config.get_model_config()
+        model_config = self._apply_env_model_config_overrides(self.config.get_model_config())
         ok, reason = self.is_model_configured(model_config)
         if not ok:
             fallback = self._generate_default_marketing_poster_content(topic, price=price_text, keyword=keyword_text)
@@ -537,6 +650,7 @@ class LLMService:
 """.strip()
 
     def _call_model(self, model_config: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
+        model_config = self._apply_env_model_config_overrides(model_config)
         endpoint = (model_config.get("api_endpoint") or "").strip()
         provider = (model_config.get("provider") or "").strip()
 
@@ -544,6 +658,34 @@ class LLMService:
         temperature = float(advanced.get("temperature", 0.7))
         max_tokens = int(advanced.get("max_tokens", 1000))
         timeout = float(advanced.get("timeout", 30))
+
+        max_tokens_env = (os.environ.get("XHS_LLM_MAX_TOKENS") or "").strip()
+        if max_tokens_env:
+            try:
+                max_tokens_val = int(float(max_tokens_env))
+                if max_tokens_val > 0:
+                    max_tokens = max_tokens_val
+            except Exception:
+                pass
+
+        # Allow env override for timeout (seconds)
+        timeout_env = (os.environ.get("XHS_LLM_TIMEOUT") or "").strip()
+        if timeout_env:
+            try:
+                timeout_val = float(timeout_env)
+                if timeout_val > 0:
+                    timeout = timeout_val
+            except Exception:
+                pass
+
+        # BigModel/GLM requests can be slower; bump minimum timeout to avoid frequent fallback.
+        try:
+            if self._is_bigmodel_endpoint(endpoint) or ("glm" in provider.lower()) or ("智谱" in provider):
+                timeout = max(timeout, 120.0)
+                # GLM-5 默认会返回较长的 reasoning_content，max_tokens 过小会导致 content 为空
+                max_tokens = max(max_tokens, 3200)
+        except Exception:
+            pass
 
         # Claude / Anthropic
         if provider.startswith("Claude") or endpoint.rstrip("/").endswith("/v1/messages") or "api.anthropic.com" in endpoint:
@@ -569,7 +711,16 @@ class LLMService:
         if endpoint.endswith("/v1"):
             return f"{endpoint}/chat/completions"
 
-        # 兜底：如果末尾没有 /v1，假设它是 base_url
+        # 一些 OpenAI-compatible 实现的 base_url 末尾是 /v3、/v4 等（如豆包/GLM），无需再拼 /v1
+        try:
+            parsed = urlparse(endpoint)
+            path = (parsed.path or "").rstrip("/")
+            if re.search(r"/v\d+$", path):
+                return f"{endpoint}/chat/completions"
+        except Exception:
+            pass
+
+        # 兜底：如果末尾没有 /v1，假设它是 OpenAI 风格 base_url
         return f"{endpoint}/v1/chat/completions"
 
     def _call_openai_compatible(
@@ -781,6 +932,29 @@ class LLMService:
     def _remove_emoji(text: str) -> str:
         if not text:
             return ""
+        text = str(text)
+        # 归一化一些在中文字体里常见的“方块/叉号”符号
+        try:
+            circled_map = {
+                "\u2139": "※",  # ℹ
+                "\u24EA": "0",  # ⓪
+                "\u24FF": "0",  # ⓿
+                "\u24F5": "1",  # ⓵
+                "\u24F6": "2",
+                "\u24F7": "3",
+                "\u24F8": "4",
+                "\u24F9": "5",
+                "\u24FA": "6",
+                "\u24FB": "7",
+                "\u24FC": "8",
+                "\u24FD": "9",
+                "\u24FE": "10",  # ⓾
+            }
+            for k, v in circled_map.items():
+                if k in text:
+                    text = text.replace(k, v)
+        except Exception:
+            pass
         try:
             emoji_pattern = re.compile(
                 "["
@@ -794,9 +968,33 @@ class LLMService:
                 "]+",
                 flags=re.UNICODE,
             )
-            text = emoji_pattern.sub("", str(text))
+            text = emoji_pattern.sub("", text)
         except Exception:
-            text = str(text)
+            pass
+
+        # 清理 emoji 组合残留（变体选择符、ZWJ、方向控制等），避免出现不可见乱码
+        try:
+            cleaned: List[str] = []
+            for ch in text:
+                if ch in {"\n", "\t"}:
+                    cleaned.append(ch)
+                    continue
+                code = ord(ch)
+                if 0xFE00 <= code <= 0xFE0F:
+                    continue
+                if 0xE0100 <= code <= 0xE01EF:
+                    continue
+                cat = unicodedata.category(ch)
+                if cat == "Cf":
+                    continue
+                if cat.startswith("M"):
+                    continue
+                if cat.startswith("C"):
+                    continue
+                cleaned.append(ch)
+            text = "".join(cleaned)
+        except Exception:
+            pass
         return text.strip()
 
     def _extract_title_content(
@@ -866,12 +1064,12 @@ class LLMService:
 
         extra_parts: List[str] = []
         if normalized_tags:
-            extra_parts.append("标签：" + " ".join(normalized_tags))
+            extra_parts.append(" ".join([f"#{t}" for t in normalized_tags if t]).strip())
         if call_to_action:
             extra_parts.append(call_to_action)
 
         if extra_parts:
-            content = f"{content}\n\n" + "\n".join([self._remove_emoji(x) for x in extra_parts if self._remove_emoji(x)])
+            content = f"{content}\n\n" + "\n\n".join([self._remove_emoji(x) for x in extra_parts if self._remove_emoji(x)])
 
         return title, content
 

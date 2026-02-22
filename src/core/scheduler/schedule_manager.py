@@ -6,21 +6,38 @@
 
 import json
 import os
-import threading
+import shutil
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import logging
 
-from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QTimer
 
 
 class ScheduleTask:
     """定时任务类"""
     
     def __init__(self, task_id: str, content: str, schedule_time: datetime, 
-                 title: str = "", images: List[str] = None):
+                 title: str = "",
+                 images: List[str] = None,
+                 user_id: Optional[int] = None,
+                 task_type: str = "fixed",
+                 interval_hours: int = 0,
+                 hotspot_source: str = "",
+                 hotspot_rank: int = 1,
+                 use_hotspot_context: bool = True,
+                 cover_template_id: str = "",
+                 page_count: int = 3):
         self.task_id = task_id
+        self.user_id = user_id
+        self.task_type = (task_type or "fixed").strip() or "fixed"
+        self.interval_hours = max(0, int(interval_hours or 0))
+        self.hotspot_source = (hotspot_source or "").strip()
+        self.hotspot_rank = max(1, int(hotspot_rank or 1))
+        self.use_hotspot_context = bool(use_hotspot_context)
+        self.cover_template_id = (cover_template_id or "").strip()
+        self.page_count = max(1, int(page_count or 3))
         self.content = content
         self.title = title
         self.images = images or []
@@ -30,11 +47,20 @@ class ScheduleTask:
         self.updated_at = datetime.now()
         self.retry_count = 0
         self.max_retries = 3
+        self.error_message = ""
     
     def to_dict(self) -> Dict:
         """转换为字典"""
         return {
             'task_id': self.task_id,
+            'user_id': self.user_id,
+            'task_type': self.task_type,
+            'interval_hours': self.interval_hours,
+            'hotspot_source': self.hotspot_source,
+            'hotspot_rank': self.hotspot_rank,
+            'use_hotspot_context': self.use_hotspot_context,
+            'cover_template_id': self.cover_template_id,
+            'page_count': self.page_count,
             'content': self.content,
             'title': self.title,
             'images': self.images,
@@ -43,7 +69,8 @@ class ScheduleTask:
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat(),
             'retry_count': self.retry_count,
-            'max_retries': self.max_retries
+            'max_retries': self.max_retries,
+            'error_message': self.error_message,
         }
     
     @classmethod
@@ -51,16 +78,25 @@ class ScheduleTask:
         """从字典创建任务"""
         task = cls(
             task_id=data['task_id'],
-            content=data['content'],
+            content=data.get('content', ''),
             schedule_time=datetime.fromisoformat(data['schedule_time']),
             title=data.get('title', ''),
-            images=data.get('images', [])
+            images=data.get('images', []),
+            user_id=data.get('user_id'),
+            task_type=data.get('task_type', 'fixed'),
+            interval_hours=data.get('interval_hours', 0),
+            hotspot_source=data.get('hotspot_source', ''),
+            hotspot_rank=data.get('hotspot_rank', 1),
+            use_hotspot_context=data.get('use_hotspot_context', True),
+            cover_template_id=data.get('cover_template_id', ''),
+            page_count=data.get('page_count', 3),
         )
         task.status = data.get('status', 'pending')
         task.created_at = datetime.fromisoformat(data['created_at'])
         task.updated_at = datetime.fromisoformat(data['updated_at'])
         task.retry_count = data.get('retry_count', 0)
         task.max_retries = data.get('max_retries', 3)
+        task.error_message = data.get('error_message', '') or ''
         return task
 
 
@@ -70,6 +106,7 @@ class ScheduleManager(QObject):
     task_started = pyqtSignal(str)  # 任务开始信号
     task_completed = pyqtSignal(str)  # 任务完成信号
     task_failed = pyqtSignal(str, str)  # 任务失败信号
+    task_execute_requested = pyqtSignal(object)  # 请求外部执行任务（dict）
     
     def __init__(self):
         super().__init__()
@@ -109,12 +146,77 @@ class ScheduleManager(QObject):
                          f, indent=2, ensure_ascii=False)
         except Exception as e:
             logging.error(f"保存定时任务失败: {str(e)}")
-    
-    def add_task(self, content: str, schedule_time: datetime, 
-                title: str = "", images: List[str] = None) -> str:
+
+    def _copy_task_images(self, task_id: str, images: List[str]) -> List[str]:
+        """将任务图片复制到稳定目录，避免后续生成覆盖导致定时任务引用错误图片。"""
+        if not images:
+            return []
+
+        safe_images = []
+        for p in images:
+            if isinstance(p, str) and p and os.path.isfile(p):
+                safe_images.append(p)
+
+        if not safe_images:
+            return []
+
+        root = os.path.join(self.config_dir, "scheduled_assets", task_id)
+        try:
+            os.makedirs(root, exist_ok=True)
+        except Exception as e:
+            logging.warning(f"创建任务图片目录失败: {e}")
+            return safe_images
+
+        copied: List[str] = []
+        for idx, src in enumerate(safe_images):
+            try:
+                ext = os.path.splitext(src)[1].lower() or ".jpg"
+                if idx == 0:
+                    name = f"cover{ext}"
+                else:
+                    name = f"content_{idx}{ext}"
+                dst = os.path.join(root, name)
+                shutil.copy2(src, dst)
+                copied.append(dst)
+            except Exception as e:
+                logging.warning(f"复制任务图片失败: {src} -> {e}")
+                copied.append(src)
+
+        return copied
+
+    def add_task(
+        self,
+        content: str,
+        schedule_time: datetime,
+        title: str = "",
+        images: List[str] = None,
+        user_id: Optional[int] = None,
+        task_type: str = "fixed",
+        interval_hours: int = 0,
+        hotspot_source: str = "",
+        hotspot_rank: int = 1,
+        use_hotspot_context: bool = True,
+        cover_template_id: str = "",
+        page_count: int = 3,
+    ) -> str:
         """添加定时任务"""
         task_id = f"task_{int(time.time())}_{hash(content) % 10000}"
-        task = ScheduleTask(task_id, content, schedule_time, title, images)
+        stable_images = self._copy_task_images(task_id, images or [])
+        task = ScheduleTask(
+            task_id,
+            content,
+            schedule_time,
+            title,
+            stable_images,
+            user_id=user_id,
+            task_type=task_type,
+            interval_hours=interval_hours,
+            hotspot_source=hotspot_source,
+            hotspot_rank=hotspot_rank,
+            use_hotspot_context=use_hotspot_context,
+            cover_template_id=cover_template_id,
+            page_count=page_count,
+        )
         
         self.tasks.append(task)
         self.save_tasks()
@@ -129,6 +231,13 @@ class ScheduleManager(QObject):
                 del self.tasks[i]
                 self.save_tasks()
                 logging.info(f"移除定时任务: {task_id}")
+                # 同步清理资源目录
+                try:
+                    assets_dir = os.path.join(self.config_dir, "scheduled_assets", task_id)
+                    if os.path.isdir(assets_dir):
+                        shutil.rmtree(assets_dir, ignore_errors=True)
+                except Exception:
+                    pass
                 return True
         return False
     
@@ -185,61 +294,78 @@ class ScheduleManager(QObject):
         task.updated_at = datetime.now()
         
         self.task_started.emit(task.task_id)
-        
-        # 这里可以集成实际的小红书发布逻辑
-        # 暂时使用模拟执行
-        success = self.publish_to_xiaohongshu(task)
-        
+        self.save_tasks()
+
+        # 交给外部执行器（例如：BrowserThread + Playwright）
+        try:
+            self.task_execute_requested.emit(task.to_dict())
+        except Exception as e:
+            self.handle_task_failure(task, str(e))
+
+    @pyqtSlot(str, bool, str)
+    def handle_task_result(self, task_id: str, success: bool, error_msg: str = ""):
+        """由外部执行器回调任务结果（通过 Qt 信号连接此方法，跨线程安全）。"""
+        task = None
+        for t in self.tasks:
+            if t.task_id == task_id:
+                task = t
+                break
+
+        if not task:
+            logging.warning(f"收到未知任务结果回调: {task_id}")
+            return
+
+        task.updated_at = datetime.now()
+        task.error_message = (error_msg or "").strip()
+
         if success:
-            task.status = "completed"
+            task.retry_count = 0
+            # “跟随热点”任务：发布成功后按 interval_hours 自动滚动到下一次
+            if str(getattr(task, "task_type", "") or "").strip() == "hotspot" and int(getattr(task, "interval_hours", 0) or 0) > 0:
+                task.schedule_time = datetime.now() + timedelta(hours=int(getattr(task, "interval_hours", 0) or 0))
+                task.status = "pending"
+            else:
+                task.status = "completed"
             self.task_completed.emit(task.task_id)
             logging.info(f"任务执行成功: {task.task_id}")
+            self.save_tasks()
+            return
+
+        task.status = "failed"
+        task.retry_count += 1
+
+        if task.retry_count < task.max_retries:
+            # 延迟重试，10分钟后重试
+            task.schedule_time = datetime.now() + timedelta(minutes=10)
+            task.status = "pending"
+            logging.warning(f"任务执行失败，准备重试: {task.task_id} ({task.retry_count}/{task.max_retries})")
         else:
-            task.status = "failed"
-            task.retry_count += 1
-            
-            if task.retry_count < task.max_retries:
-                # 延迟重试，10分钟后重试
-                task.schedule_time = datetime.now() + timedelta(minutes=10)
-                task.status = "pending"
-                logging.warning(f"任务执行失败，准备重试: {task.task_id}")
-            else:
-                self.task_failed.emit(task.task_id, "达到最大重试次数")
-                logging.error(f"任务执行失败: {task.task_id}")
-        
-        task.updated_at = datetime.now()
+            self.task_failed.emit(task.task_id, task.error_message or "达到最大重试次数")
+            logging.error(f"任务执行失败: {task.task_id}")
+
         self.save_tasks()
-    
-    def publish_to_xiaohongshu(self, task: ScheduleTask) -> bool:
-        """发布到小红书（模拟实现）"""
-        # 这里集成实际的小红书发布API
-        # 返回True表示成功，False表示失败
-        
-        try:
-            # 模拟发布过程
-            time.sleep(2)  # 模拟网络请求时间
-            
-            # 实际实现时需要：
-            # 1. 调用小红书API登录
-            # 2. 上传图片（如果有）
-            # 3. 发布内容
-            
-            logging.info(f"模拟发布成功: {task.title}")
-            return True
-            
-        except Exception as e:
-            logging.error(f"发布失败: {str(e)}")
-            return False
     
     def handle_task_failure(self, task: ScheduleTask, error_msg: str):
         """处理任务失败"""
         logging.error(f"任务 {task.task_id} 失败: {error_msg}")
-        # 可以在这里添加失败通知机制
+        try:
+            self.handle_task_result(task.task_id, False, error_msg)
+        except Exception:
+            # 可以在这里添加失败通知机制
+            pass
     
     def clear_completed_tasks(self):
         """清理已完成的任务"""
+        completed_ids = [t.task_id for t in self.tasks if t.status == "completed"]
         self.tasks = [task for task in self.tasks if task.status != "completed"]
         self.save_tasks()
+        for task_id in completed_ids:
+            try:
+                assets_dir = os.path.join(self.config_dir, "scheduled_assets", task_id)
+                if os.path.isdir(assets_dir):
+                    shutil.rmtree(assets_dir, ignore_errors=True)
+            except Exception:
+                pass
         logging.info("已清理已完成的任务")
     
     def get_task_stats(self) -> Dict:

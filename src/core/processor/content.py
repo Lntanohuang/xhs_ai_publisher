@@ -1,12 +1,9 @@
 import json
 import re
-import traceback
 import time
 import os
 import uuid
 from PyQt5.QtCore import QThread, pyqtSignal
-import requests
-from requests.exceptions import RequestException, Timeout, ConnectionError
 
 # 导入备用生成器
 from .content_backup import BackupContentGenerator
@@ -14,8 +11,6 @@ from src.config.config import Config
 from src.core.services.llm_service import llm_service, LLMServiceError
 from src.core.services.system_image_template_service import system_image_template_service
 
-
-"""历史版本，基于coze生成图片 - 增强版错误处理 + 故障转移"""
 
 class ContentGeneratorThread(QThread):
     finished = pyqtSignal(dict)
@@ -27,9 +22,8 @@ class ContentGeneratorThread(QThread):
         self.header_title = header_title
         self.author = author
         self.generate_btn = generate_btn
-        self.max_retries = 2  # 减少重试次数，更快切换到备用方案
-        self.retry_delay = 2  # 减少重试间隔
-        self.use_backup = False
+        self._last_llm_error = ""
+        self._backup_info_reason = ""
 
     def run(self):
         """主运行方法，包含重试逻辑和故障转移"""
@@ -59,48 +53,15 @@ class ContentGeneratorThread(QThread):
                     pass
             return
 
-        allow_fallback = os.environ.get("XHS_ALLOW_FALLBACK", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
+        # 默认允许回退到“本地备用生成器”，避免模型未配置/调用失败导致完全不可用；
+        # 如需严格模式（不回退），可设置：XHS_ALLOW_FALLBACK=0/false/off
+        allow_fallback = os.environ.get("XHS_ALLOW_FALLBACK", "").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "n",
+            "off",
         }
-
-        # 默认走 8.* 远程接口（用户反馈样式更好）；当用户选择了其他封面模板时，优先走大模型
-        prefer_remote_first = not bool(selected_cover_tpl)
-
-        def _try_remote() -> bool:
-            if not self._should_use_remote_workflow_api():
-                self._last_remote_error = "默认接口不可用：无法连接到远程服务"
-                return False
-
-            retry_count = 0
-            last_error = ""
-            while retry_count < self.max_retries:
-                try:
-                    print(f"🚀 开始第 {retry_count + 1} 次尝试生成内容...")
-                    self._generate_content()
-                    return True
-                except Exception as e:
-                    retry_count += 1
-                    error_msg = str(e)
-                    last_error = error_msg
-
-                    if retry_count < self.max_retries:
-                        print(f"⚠️ 第 {retry_count} 次尝试失败: {error_msg}")
-                        print(f"🔄 {self.retry_delay} 秒后进行第 {retry_count + 1} 次重试...")
-                        try:
-                            self.generate_btn.setText(f"⏳ 重试中({retry_count + 1}/{self.max_retries})...")
-                        except Exception:
-                            pass
-                        time.sleep(self.retry_delay)
-                    else:
-                        print(f"❌ 主API所有 {self.max_retries} 次尝试都失败了")
-                        self._last_remote_error = last_error or "默认接口生成失败"
-                        return False
-
-            return False
 
         def _try_llm() -> bool:
             try:
@@ -125,31 +86,46 @@ class ContentGeneratorThread(QThread):
                     pass
                 return False
 
-        if prefer_remote_first:
-            if _try_remote():
-                return
-            if allow_fallback:
-                if _try_llm():
-                    return
-                _try_backup(reason="远程服务不可用，已切换为本地生成（图片为占位图）")
-                return
-
-            # 不允许回退：直接报错（避免误以为仍在使用默认接口）
-            self.error.emit(getattr(self, "_last_remote_error", "") or "默认接口生成失败")
-            return
-
-        # 选择了封面模板：优先走大模型；若未配置，则退回 8.* 接口生成文案（图片会在首页按所选封面模板重新生成）
+        # ✅ 优先使用用户配置的大模型（含本地模型）；失败时可回退到本地备用生成器（离线可用）。
         if _try_llm():
             return
-        if _try_remote():
-            return
+
         if allow_fallback:
-            _try_backup(reason="未配置可用的大模型/远程服务，已切换为本地生成（图片为占位图）")
+            # 兜底：走本地备用生成器（离线可用）
+            last = getattr(self, "_last_llm_error", "")
+            last_text = (str(last or "").strip() or "")
+
+            def _summarize_error(text: str) -> str:
+                s = (text or "").strip()
+                if not s:
+                    return ""
+                if ("HTTP 401" in s) or ("invalid_api_key" in s) or ("Incorrect API key" in s):
+                    return "模型鉴权失败（401）：API Key 无效/过期，请到「后台配置 → 模型配置」更新"
+                if ("HTTP 403" in s) or ("forbidden" in s.lower()):
+                    return "模型鉴权失败（403）：无权限访问，请检查 Key/权限"
+                if ("HTTP 429" in s) or ("rate limit" in s.lower()):
+                    return "模型接口限流/额度不足（429），请稍后重试或更换模型"
+                if ("HTTP 5" in s) or ("server error" in s.lower()):
+                    return "模型服务端异常（5xx），请稍后重试"
+                if ("Connection refused" in s) or ("连接" in s and "失败" in s) or ("模型请求失败" in s):
+                    return "无法连接模型端点，请检查端点地址与本地服务是否已启动"
+
+                # 兜底：只截取第一段，避免弹窗展示大段 JSON
+                first_line = s.splitlines()[0].strip() if s.splitlines() else s
+                if len(first_line) > 120:
+                    first_line = first_line[:120] + "..."
+                return first_line
+
+            short = _summarize_error(last_text)
+            reason = "⚠️ 大模型不可用，已切换为本地生成"
+            if short:
+                reason += f"\n{short}"
+            _try_backup(reason=reason)
             return
 
-        # 不允许回退：优先给出更明确的错误信息
-        last = getattr(self, "_last_remote_error", "") or getattr(self, "_last_llm_error", "")
-        self.error.emit(last or "生成失败：未配置可用的大模型/远程服务")
+        # 严格模式：不回退，直接报错
+        last = getattr(self, "_last_llm_error", "")
+        self.error.emit(last or "生成失败：未配置可用的大模型")
         return
 
     def _generate_marketing_poster(self) -> None:
@@ -169,22 +145,19 @@ class ContentGeneratorThread(QThread):
             keyword=keyword_hint,
         )
 
-        # 若模型不可用/失败，则使用默认接口生成的 AI 文案来填充海报
-        if str(content.get("__source") or "").strip().lower() != "llm":
+        # 可选：注入用户选择的“营销海报素材”（透明 PNG）
+        try:
+            asset_path = str(Config().get_templates_config().get("marketing_poster_asset_path") or "").strip()
+        except Exception:
+            asset_path = ""
+        asset_path = os.path.expanduser(asset_path) if asset_path else ""
+        if asset_path and os.path.exists(asset_path):
             try:
-                remote_seed = self._generate_marketing_poster_seed_via_remote()
-                content = self._build_marketing_poster_content_from_remote(
-                    remote_seed,
-                    price=price_hint,
-                    keyword=keyword_hint,
-                )
-            except Exception as e:
-                # 保留默认 fallback 内容
-                try:
-                    content.setdefault("__source", "default")
-                    content["__error_remote"] = str(e)
-                except Exception:
-                    pass
+                content["asset_image_path"] = asset_path
+            except Exception:
+                pass
+
+        # 不再使用任何远程兜底：只走本地/大模型生成（避免风控/波动导致生成失败）
 
         cover_path, content_paths = marketing_poster_service.generate_to_local_paths(content)
         if not cover_path or not content_paths:
@@ -224,295 +197,9 @@ class ContentGeneratorThread(QThread):
     @staticmethod
     def _format_marketing_poster_info_reason(content: dict) -> str:
         source = str((content or {}).get("__source") or "").strip().lower()
-        if source == "remote":
-            return "🪧 营销海报：默认接口 AI 文案 + 本地渲染"
         if source == "llm":
             return "🪧 营销海报：大模型 AI 文案 + 本地渲染"
         return "🪧 营销海报：默认文案 + 本地渲染"
-
-    @staticmethod
-    def _build_remote_session() -> requests.Session:
-        """构造请求 Session：如系统代理指向本机但不可用，则自动禁用代理。"""
-        sess = requests.Session()
-        use_proxy = os.environ.get("XHS_REMOTE_WORKFLOW_USE_PROXY", "").strip().lower() in {"1", "true", "yes", "y", "on"}
-        if not use_proxy:
-            sess.trust_env = False
-            return sess
-        try:
-            import socket
-            import urllib.request
-            from urllib.parse import urlparse
-
-            proxies = urllib.request.getproxies() or {}
-            proxy_url = proxies.get("http") or proxies.get("https") or ""
-            if proxy_url and ("127.0.0.1" in proxy_url or "localhost" in proxy_url):
-                parsed = urlparse(proxy_url)
-                host = parsed.hostname or ""
-                port = parsed.port or 0
-                if host and port:
-                    try:
-                        with socket.create_connection((host, int(port)), timeout=0.25):
-                            return sess
-                    except Exception:
-                        sess.trust_env = False
-        except Exception:
-            pass
-        return sess
-
-    def _generate_marketing_poster_seed_via_remote(self) -> dict:
-        """使用默认远程接口生成一份 AI 文案（title/content/contentlist），用于填充营销海报。"""
-        if not self._should_use_remote_workflow_api():
-            raise RuntimeError("默认接口不可用：无法连接到远程服务")
-
-        api_url = "http://8.137.103.115:8081/workflow/run"
-        workflow_id = "7431484143153070132"
-        parameters = {
-            "BOT_USER_INPUT": self.input_text,
-            "HEADER_TITLE": self.header_title,
-            "AUTHOR": self.author,
-        }
-
-        connect_timeout = float(os.environ.get("XHS_REMOTE_WORKFLOW_CONNECT_TIMEOUT", "5") or 5)
-        read_timeout = float(os.environ.get("XHS_REMOTE_WORKFLOW_READ_TIMEOUT", "180") or 180)
-
-        sess = self._build_remote_session()
-        resp = sess.post(
-            api_url,
-            json={"workflow_id": workflow_id, "parameters": parameters},
-            timeout=(connect_timeout, read_timeout),
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "XhsAiPublisher/1.0",
-                "Accept": "application/json",
-            },
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"默认接口调用失败: HTTP {resp.status_code}")
-
-        res = resp.json() or {}
-        raw_data = res.get("data")
-        if isinstance(raw_data, str):
-            full_data = json.loads(raw_data)
-        elif isinstance(raw_data, dict):
-            full_data = raw_data
-        else:
-            raise RuntimeError("默认接口返回格式异常")
-
-        output_raw = full_data.get("output") or ""
-        output_obj: dict = {}
-        try:
-            if isinstance(output_raw, str):
-                output_obj = json.loads(output_raw) if output_raw.strip().startswith("{") else {}
-            elif isinstance(output_raw, dict):
-                output_obj = output_raw
-        except Exception:
-            output_obj = {}
-
-        contentlist_raw = full_data.get("contentlist")
-        contentlist: list = []
-        try:
-            if isinstance(contentlist_raw, str) and contentlist_raw.strip().startswith("["):
-                contentlist = json.loads(contentlist_raw)
-            elif isinstance(contentlist_raw, list):
-                contentlist = contentlist_raw
-        except Exception:
-            contentlist = []
-
-        seed_title = str(output_obj.get("title") or "").strip()
-        seed_content = str(full_data.get("content") or output_obj.get("content") or "").strip()
-        seed_content_pages = self._build_pages_from_content_list(contentlist) if contentlist else []
-        return {
-            "title": seed_title,
-            "content": seed_content,
-            "contentlist": contentlist,
-            "content_pages": seed_content_pages,
-            "raw": full_data,
-            "output": output_obj,
-        }
-
-    def _build_marketing_poster_content_from_remote(self, seed: dict, *, price: str = "", keyword: str = "") -> dict:
-        from src.core.services.marketing_poster_service import clean_text
-
-        topic = (self.input_text or "").strip()
-        seed_title = clean_text(str((seed or {}).get("title") or "")) or clean_text(topic)
-        if len(seed_title) > 18:
-            seed_title = seed_title[:18]
-
-        seed_content = str((seed or {}).get("content") or "").strip()
-        seed_content_clean = clean_text(seed_content)
-        seed_content_clean = re.sub(r"#\S+", "", seed_content_clean).strip()
-
-        price_value = (price or "").strip() or self._extract_price_value(topic) or self._extract_price_value(seed_content)
-        keyword_value = (keyword or "").strip() or "咨询"
-
-        contentlist = (seed or {}).get("contentlist") or []
-        if not isinstance(contentlist, list):
-            contentlist = []
-
-        # cover bullets：从 contentlist 的描述句中抽取
-        bullet_candidates: list[str] = []
-        for it in contentlist:
-            raw = str(it or "")
-            body = raw.split("~~~", 1)[1] if "~~~" in raw else ""
-            body = clean_text(body)
-            body = re.sub(r"#\S+", "", body).strip()
-            if not body:
-                continue
-            for seg in re.split(r"[，、;；。！？!?\n]", body):
-                seg = clean_text(seg).strip()
-                if len(seg) < 4:
-                    continue
-                bullet_candidates.append(seg)
-
-        cover_bullets: list[str] = []
-        for b in bullet_candidates:
-            if b not in cover_bullets:
-                cover_bullets.append(b)
-            if len(cover_bullets) >= 3:
-                break
-        if len(cover_bullets) < 3:
-            fallback = [
-                "资料重点清晰，查漏补缺更高效",
-                "一套搞定核心内容，省时省心",
-                "适合快速上手，马上可用",
-            ]
-            for f in fallback:
-                if len(cover_bullets) >= 3:
-                    break
-                cover_bullets.append(f)
-
-        # highlights：优先用 contentlist 的标题 + 描述
-        def _short_title(text: str, max_len: int = 9) -> str:
-            t = clean_text(text)
-            t = re.sub(r"[0-9.]+", "", t)
-            t = t.replace("元", "").replace("块", "").replace("￥", "").replace("¥", "")
-            t = re.sub(r"[\s·•\-—_]+", "", t)
-            t = t.strip()
-            if len(t) > max_len:
-                t = t[:max_len]
-            return t or "亮点"
-
-        highlights: list[dict[str, str]] = []
-        for it in contentlist:
-            raw = str(it or "")
-            title_part = raw.split("~~~", 1)[0] if "~~~" in raw else raw
-            body_part = raw.split("~~~", 1)[1] if "~~~" in raw else ""
-            h_title = _short_title(title_part)
-            h_desc = clean_text(body_part)
-            h_desc = re.sub(r"#\S+", "", h_desc).strip()
-            if len(h_desc) > 34:
-                h_desc = h_desc[:34]
-            highlights.append({"title": h_title, "desc": h_desc or "一句话说明它能解决什么问题"})
-            if len(highlights) >= 4:
-                break
-
-        if len(highlights) < 4:
-            sentences = [s.strip() for s in re.split(r"[。！？!?\n]", seed_content_clean) if s.strip()]
-            for s in sentences:
-                if len(highlights) >= 4:
-                    break
-                if len(s) < 6:
-                    continue
-                highlights.append({"title": "省心高效", "desc": s[:34]})
-        highlights = highlights[:4]
-
-        # pain points：优先从正文的“问题句”里抽取
-        pain_points: list[str] = []
-        pain_keywords = ["头疼", "没效果", "浪费", "不知道", "焦虑", "担心", "不会", "太难", "踩坑", "避雷"]
-        for s in [x.strip() for x in re.split(r"[。！？!?\n]", seed_content_clean) if x.strip()]:
-            if any(k in s for k in pain_keywords):
-                if s not in pain_points:
-                    pain_points.append(s)
-            if len(pain_points) >= 4:
-                break
-        while len(pain_points) < 4:
-            pain_points.append(["选资料不知从哪下手", "内容太杂抓不住重点", "花了钱效果不稳定", "缺少可复用的学习计划"][len(pain_points)])
-
-        # audience：简单按关键词生成 3 类人群
-        audience_text = seed_content_clean + " " + topic
-        is_parent = ("宝妈" in audience_text) or ("家长" in audience_text) or ("爸妈" in audience_text) or ("妈妈" in audience_text)
-        audience: list[dict[str, Any]] = []
-        if is_parent:
-            audience.append({"badge": "家", "title": "宝妈/家长", "bullets": ["想省时省心辅导", "需要一套全科资料"]})
-        audience.append({"badge": "冲", "title": "期末/考试冲刺", "bullets": ["想要高频考点归纳", "需要刷题卷/练习册"]})
-        audience.append({"badge": "补", "title": "查漏补缺", "bullets": ["基础薄弱想补短板", "希望稳步提分"]})
-        audience = audience[:3]
-
-        caption = str((seed or {}).get("content") or "").strip()
-        if not caption:
-            caption = f"关于「{topic}」的营销海报已生成，想看示例/清单欢迎私信。"
-
-        # outline_items：用于“要点一图看懂”页，尽量用 AI 生成的真实内容填充
-        def _short_outline_item(text: str, max_len: int = 16) -> str:
-            t = clean_text(text)
-            t = re.sub(r"#\S+", "", t).strip()
-            # 去掉常见口头禅/装饰符号
-            t = t.replace("❗", "").replace("！", "").replace("🔥", "")
-            # 若以价格开头，避免“29.9元...”占满一行（但保留“价格 29.9元”这种）
-            t = re.sub(r"^(?:￥|¥)?\s*\d+(?:\.\d{1,2})?\s*(?:元|块)\s*", "", t)
-            t = re.sub(r"\s+", "", t).strip("，。；;:：!！?？-—_·•|｜“”\"'「」")
-            if len(t) > max_len:
-                t = t[:max_len]
-            return t
-
-        outline_items: list[str] = []
-
-        def _push_outline(val: str) -> None:
-            nonlocal outline_items
-            if len(outline_items) >= 10:
-                return
-            item = _short_outline_item(val)
-            if not item or len(item) < 4:
-                return
-            if item not in outline_items:
-                outline_items.append(item)
-
-        # 1) 优先用 contentlist 的描述句
-        for b in bullet_candidates:
-            _push_outline(b)
-
-        # 2) 再用 highlights 标题
-        for h in highlights:
-            if not isinstance(h, dict):
-                continue
-            _push_outline(str(h.get("title") or ""))
-
-        # 3) 不足则从正文里补齐
-        if len(outline_items) < 8:
-            for seg in re.split(r"[，、;；。！？!?\n]", seed_content_clean):
-                _push_outline(seg)
-                if len(outline_items) >= 10:
-                    break
-
-        # 4) 兜底补一些关键维度
-        derived: list[str] = []
-        if price_value:
-            derived.append(f"价格 {price_value}元")
-        if is_parent:
-            derived.append("宝妈/家长适用")
-        derived.append(f"私信{keyword_value}领取")
-        for d in derived:
-            _push_outline(d)
-
-        while len(outline_items) < 8:
-            outline_items.append(["核心卖点清晰", "交付方式明确", "适合人群明确", "使用建议可执行"][len(outline_items) % 4])
-
-        return {
-            "title": seed_title or "营销海报",
-            "subtitle": "一套看懂卖点与交付路径",
-            "price": price_value,
-            "keyword": keyword_value,
-            "accent": "blue",
-            "cover_bullets": cover_bullets[:3],
-            "outline_items": outline_items[:10],
-            "highlights": highlights,
-            "delivery_steps": [f"评论/私信「{keyword_value}」", "确认需求/领取资料", "开始使用/复盘优化"],
-            "pain_points": pain_points[:4],
-            "audience": audience,
-            "caption": caption,
-            "disclaimer": "仅供参考｜请遵守平台规则",
-            "__source": "remote",
-        }
 
     def _use_backup_generator(self, info_reason: str = ""):
         """使用备用生成器"""
@@ -554,248 +241,6 @@ class ContentGeneratorThread(QThread):
         """处理备用生成器的错误"""
         print(f"❌ 备用生成器也失败了: {error_msg}")
         self.error.emit(error_msg)
-
-    def _generate_content(self):
-        """实际的内容生成逻辑（主API）"""
-        try:
-            # 更新按钮状态
-            self.generate_btn.setText("⏳ 接口生成中...")
-            self.generate_btn.setEnabled(False)
-
-            # 打印详细的输入信息
-            print("=" * 60)
-            print("🚀 开始生成内容...")
-            print(f"📝 输入内容: {self.input_text[:100]}{'...' if len(self.input_text) > 100 else ''}")
-            print(f"🏷️ 眉头标题: {self.header_title}")
-            print(f"👤 作者: {self.author}")
-            print("=" * 60)
-
-            workflow_id = "7431484143153070132"
-            parameters = {
-                "BOT_USER_INPUT": self.input_text,
-                "HEADER_TITLE": self.header_title,
-                "AUTHOR": self.author
-            }
-
-            api_url = "http://8.137.103.115:8081/workflow/run"
-            print(f"🌐 API地址: {api_url}")
-            print(f"📦 工作流ID: {workflow_id}")
-            print(f"📋 请求参数: {parameters}")
-
-            # 发送API请求
-            print("📡 发送API请求...")
-            try:
-                # 远程工作流偶发较慢（生成图片/排版），默认给更长的读取超时；可用环境变量覆盖
-                connect_timeout = float(os.environ.get("XHS_REMOTE_WORKFLOW_CONNECT_TIMEOUT", "5") or 5)
-                read_timeout = float(os.environ.get("XHS_REMOTE_WORKFLOW_READ_TIMEOUT", "120") or 120)
-                response = requests.post(
-                    api_url,
-                    json={
-                        "workflow_id": workflow_id,
-                        "parameters": parameters
-                    },
-                    timeout=(connect_timeout, read_timeout),
-                    headers={
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'XhsAiPublisher/1.0',
-                        'Accept': 'application/json'
-                    }
-                )
-                
-                print(f"✅ API请求发送成功")
-                print(f"📊 响应状态码: {response.status_code}")
-                print(f"📄 响应头信息: {dict(response.headers)}")
-                
-            except ConnectionError as e:
-                error_msg = f"网络连接失败: {str(e)}"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-            except Timeout as e:
-                error_msg = f"API请求超时（{int(read_timeout)}秒）: {str(e)}"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-            except RequestException as e:
-                error_msg = f"API请求异常: {str(e)}"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-
-            # 检查HTTP状态码
-            if response.status_code != 200:
-                error_detail = ""
-                try:
-                    error_detail = response.text[:200]
-                    print(f"❌ API错误响应: {error_detail}")
-                except:
-                    error_detail = "无法获取错误详情"
-                
-                error_msg = f"API调用失败，状态码: {response.status_code}"
-                if response.status_code == 400:
-                    error_msg += " - 请求参数错误或API格式已更改"
-                elif response.status_code == 404:
-                    error_msg += " - API接口不存在"
-                elif response.status_code == 500:
-                    error_msg += " - 服务器内部错误"
-                elif response.status_code == 502:
-                    error_msg += " - 网关错误，服务不可用"
-                elif response.status_code == 403:
-                    error_msg += " - 访问被拒绝"
-                
-                raise Exception(error_msg)
-
-            # 解析响应数据
-            try:
-                response_text = response.text
-                print(f"📝 API原始响应长度: {len(response_text)} 字符")
-                print(f"📝 API响应前500字符: {response_text[:500]}")
-                
-                res = response.json()
-                print(f"✅ JSON解析成功")
-                print(f"📊 响应数据键: {list(res.keys())}")
-                
-            except json.JSONDecodeError as e:
-                error_msg = f"API响应JSON解析失败: {str(e)}"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-
-            # 验证响应数据结构
-            if 'data' not in res:
-                # 兼容错误返回：{code,msg,detail,debug_url}
-                if isinstance(res, dict) and res.get("code") is not None:
-                    code = res.get("code")
-                    msg = str(res.get("msg") or "").strip()
-                    debug_url = str(res.get("debug_url") or "").strip()
-                    detail = res.get("detail") if isinstance(res.get("detail"), dict) else {}
-                    logid = str((detail or {}).get("logid") or "").strip()
-
-                    parts = [f"远程工作流执行失败(code={code})"]
-                    if msg:
-                        parts.append(msg)
-                    if logid:
-                        parts.append(f"logid: {logid}")
-                    if debug_url:
-                        parts.append(f"debug_url: {debug_url}")
-                    error_msg = " | ".join(parts)
-                    print(f"❌ {error_msg}")
-                    raise Exception(error_msg)
-
-                error_msg = f"API响应格式错误，缺少'data'字段"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-            
-            try:
-                if isinstance(res['data'], dict):
-                    output_data = res['data']
-                else:
-                    output_data = json.loads(res['data'])
-                print(f"✅ 输出数据解析成功")
-                print(f"📊 输出数据键: {list(output_data.keys())}")
-                
-            except json.JSONDecodeError as e:
-                error_msg = f"输出数据JSON解析失败: {str(e)}"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-            
-            # 验证必需字段
-            required_fields = ['output', 'content']
-            missing_fields = []
-            for field in required_fields:
-                if field not in output_data:
-                    missing_fields.append(field)
-            
-            if missing_fields:
-                error_msg = f"输出数据缺少必需字段: {missing_fields}"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-            
-            # 解析标题数据
-            try:
-                title_data = json.loads(output_data['output'])
-                print(f"✅ 标题数据解析成功")
-                
-                if 'title' not in title_data:
-                    error_msg = f"标题数据格式错误，缺少'title'字段"
-                    print(f"❌ {error_msg}")
-                    raise Exception(error_msg)
-                
-                title = title_data['title']
-                
-            except json.JSONDecodeError as e:
-                error_msg = f"标题数据JSON解析失败: {str(e)}"
-                print(f"❌ {error_msg}")
-                raise Exception(error_msg)
-            
-            # 检查图片相关字段
-            try:
-                full_data = json.loads(res['data'])
-                image_fields = ['image', 'image_content']
-                for field in image_fields:
-                    if field not in full_data:
-                        print(f"⚠️ 警告: 缺少图片字段 '{field}'，将使用空值")
-                
-                cover_image = full_data.get('image', '')
-                content_images = full_data.get('image_content', [])
-                
-            except Exception as e:
-                print(f"⚠️ 图片数据处理警告: {str(e)}")
-                cover_image = ''
-                content_images = []
-
-            # 构建结果
-            content_pages = []
-            try:
-                raw_list = output_data.get('contentlist')
-                if isinstance(raw_list, str) and raw_list.strip().startswith("["):
-                    raw_list = json.loads(raw_list)
-                if isinstance(raw_list, list):
-                    content_pages = self._build_pages_from_content_list(raw_list)
-            except Exception:
-                content_pages = []
-
-            # 优化内容排版：优先用 contentlist 生成更“小红书”的分段文本
-            formatted_content = ""
-            try:
-                formatted_content = self._format_content_text(
-                    output_data.get("content"),
-                    output_data.get("contentlist"),
-                )
-            except Exception:
-                formatted_content = str(output_data.get("content") or "").strip()
-
-            result = {
-                'title': title,
-                'content': formatted_content,
-                'cover_image': cover_image,
-                'content_images': content_images,
-                'input_text': self.input_text,
-                'content_pages': content_pages,
-                'generator': 'remote',
-                'info_reason': '已使用默认生成',
-            }
-            
-            # 打印成功信息
-            print("🎉 内容生成成功!")
-            print(f"📌 标题: {title}")
-            print(f"📄 内容长度: {len(result['content'])} 字符")
-            print(f"📄 内容预览: {result['content'][:100]}...")
-            print(f"🖼️ 封面图片: {'有' if cover_image else '无'}")
-            print(f"📸 内容图片数量: {len(content_images) if isinstance(content_images, list) else 0}")
-            print("=" * 60)
-
-            self.finished.emit(result)
-                
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ 主API生成内容失败: {error_msg}")
-            print(f"🔍 详细错误信息:")
-            print(traceback.format_exc())
-            print("=" * 60)
-            raise e
-        finally:
-            # 只有在不使用备用生成器时才恢复按钮状态
-            if not self.use_backup:
-                if hasattr(self, 'generate_btn'):
-                    self.generate_btn.setText("✨ 生成内容")
-                    self.generate_btn.setEnabled(True)
 
     def _try_generate_with_custom_model(self) -> bool:
         """如果用户已配置模型，则使用自定义模型生成文案，并生成本地占位图片。"""
@@ -974,6 +419,21 @@ class ContentGeneratorThread(QThread):
             except Exception:
                 return ""
 
+        def _format_head(head: str) -> str:
+            h = (head or "").strip()
+            if not h:
+                return ""
+            # 去掉 markdown 标题前缀
+            h = re.sub(r"^#+\\s*", "", h).strip()
+            if not h:
+                return ""
+            if (h.startswith("【") and h.endswith("】")) or (h.startswith("[") and h.endswith("]")):
+                return h
+            # 短标题用「【】」更像小红书的分段样式
+            if len(h) <= 18 and not re.search(r"[。！？!?，,;；]", h):
+                return f"【{h}】"
+            return h
+
         def _is_tag_head(h: str) -> bool:
             h = (h or "").strip()
             return h in {"标签", "话题", "话题标签"} or ("标签" in h) or ("话题" in h)
@@ -1010,6 +470,9 @@ class ContentGeneratorThread(QThread):
                         continue
                     blank = False
                     normalized.append(ln.strip())
+                # 若原文本没有用空行分段，则把每行当作一段（更符合小红书阅读节奏）
+                if "" not in normalized and len([x for x in normalized if str(x).strip()]) >= 2:
+                    return "\n\n".join([x for x in normalized if str(x).strip()]).strip()
                 return "\n".join(normalized).strip()
 
             # 无换行：按句号/问号/感叹号切分，控制每段 1-2 句
@@ -1042,6 +505,36 @@ class ContentGeneratorThread(QThread):
                     parts.append(rest2)
                 if len(parts) > 1:
                     sents = parts
+
+            # 仍然是一整段且缺少标点：按长度硬拆（提升可读性）
+            if len(sents) <= 1 and len(raw) > 90:
+                tag_cluster = ""
+                text_part = raw
+                try:
+                    m = re.search(r"(#[^#\s]{1,24}){2,}$", raw)
+                except Exception:
+                    m = None
+                if m:
+                    try:
+                        tag_cluster = str(m.group(0) or "").strip()
+                    except Exception:
+                        tag_cluster = ""
+                    text_part = (raw[: m.start()] or "").strip()
+
+                para_size = 56
+                paras = []
+                for i in range(0, len(text_part), para_size):
+                    p = (text_part[i : i + para_size] or "").strip()
+                    if p:
+                        paras.append(p)
+                out = "\n\n".join(paras).strip() if paras else text_part.strip()
+
+                if tag_cluster:
+                    tags = [t.strip() for t in tag_cluster.split("#") if t.strip()]
+                    if tags:
+                        out = (out + "\n\n" + " ".join([f"#{t}" for t in tags])).strip()
+
+                return out or raw
 
             paras = []
             cur = []
@@ -1101,17 +594,17 @@ class ContentGeneratorThread(QThread):
 
                 block_lines = []
                 if head:
-                    block_lines.append(head)
+                    block_lines.append(_format_head(head))
                 if body:
                     block_lines.append(_auto_paragraphize(body))
                 block = "\n".join([x for x in block_lines if x]).strip()
                 if block:
                     sections.append(block)
 
-        # 如果没拿到 contentlist，则退化到 content 字段
-        if not sections:
-            base = _as_str(content_value)
-            return _auto_paragraphize(base)
+        base = _as_str(content_value)
+        base_formatted = _auto_paragraphize(base)
+
+        from_list = "\n\n".join(sections).strip()
 
         # 去重标签
         if tags:
@@ -1125,10 +618,27 @@ class ContentGeneratorThread(QThread):
                 uniq.append(t)
             tags = uniq[:12]
 
+        tag_line = ""
         if tags:
-            sections.append("话题标签：" + " ".join(tags))
+            tag_line = " ".join([f"#{t}" for t in tags if _as_str(t)]).strip()
 
-        return "\n\n".join(sections).strip()
+        # 排版优先用 contentlist（有分段/小标题更好读）；拿不到再用 content 的自动分段
+        body = ""
+        if from_list:
+            body = from_list
+            # contentlist 只有 1 段且太短时，优先用完整正文
+            try:
+                if len(sections) <= 1 and base_formatted and len(base_formatted) >= 180 and len(body) < 120:
+                    body = base_formatted
+            except Exception:
+                pass
+        else:
+            body = base_formatted
+
+        if tag_line and body and not re.search(r"#\S", body):
+            body = (body.rstrip() + "\n\n" + tag_line).strip()
+
+        return (body or "").strip()
 
     def _generate_local_placeholder_images(self, title: str, count: int = 3):
         """生成本地占位图片，避免依赖外部图片服务。"""
@@ -1167,26 +677,3 @@ class ContentGeneratorThread(QThread):
             content_paths.append(p)
 
         return cover_path, content_paths
-
-    def _should_use_remote_workflow_api(self) -> bool:
-        """是否尝试使用远程工作流 API（默认开启，可通过环境变量关闭）。"""
-        # 允许强制关闭（优先级更高）
-        if os.environ.get("XHS_DISABLE_REMOTE_WORKFLOW", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
-            return False
-
-        # 先做一次快速连通性判断，避免卡在 30s 超时
-        try:
-            import socket
-            from urllib.parse import urlparse
-
-            api_url = "http://8.137.103.115:8081/workflow/run"
-            parsed = urlparse(api_url)
-            host = parsed.hostname or ""
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            if not host:
-                return False
-
-            with socket.create_connection((host, port), timeout=2):
-                return True
-        except Exception:
-            return False

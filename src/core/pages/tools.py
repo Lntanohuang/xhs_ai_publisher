@@ -1,5 +1,4 @@
 import base64
-import sys
 import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,6 +12,7 @@ from PyQt5.QtGui import QPixmap
 
 from src.core.alert import TipWindow
 from .database_management import DatabaseManagementPage
+from src.core.ui.qt_font import get_ui_text_font_family_css
 
 
 class VideoProcessThread(QThread):
@@ -231,28 +231,28 @@ class ToolsPage(QWidget):
 
         # 创建视频去水印工具区域
         watermark_frame = QFrame()
-        watermark_frame.setStyleSheet("""
-            QFrame {
+        watermark_frame.setStyleSheet(f"""
+            QFrame {{
                 padding: 8px;  /* 减小内边距 */
                 background-color: white;
                 border: none;
                 border-radius: 8px;
-            }
-            QLabel {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLabel {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 12pt;
                 color: #2c3e50;
-            }
-            QLineEdit {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLineEdit {{
+                font-family: {get_ui_text_font_family_css()};
                 padding: 4px;  /* 减小输入框内边距 */
                 font-size: 12pt;
                 border: 1px solid #ddd;
                 border-radius: 4px;
                 background-color: white;
-            }
-            QPushButton {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QPushButton {{
+                font-family: {get_ui_text_font_family_css()};
                 padding: 6px;  /* 减小按钮内边距 */
                 font-size: 14pt;
                 font-weight: bold;
@@ -261,10 +261,10 @@ class ToolsPage(QWidget):
                 border: none;
                 border-radius: 4px;
                 margin-top: 8px;  /* 减小上边距 */
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: #357abd;
-            }
+            }}
         """)
         watermark_layout = QVBoxLayout(watermark_frame)
         watermark_layout.setSpacing(3)  # 减小组件间距
@@ -334,26 +334,26 @@ class ToolsPage(QWidget):
 
         # 创建结果展示区域
         result_frame = QFrame()
-        result_frame.setStyleSheet("""
-            QFrame {
+        result_frame.setStyleSheet(f"""
+            QFrame {{
                 margin-top: 8px;
                 padding: 12px;
                 background-color: white;
                 border: none;
-            }
-            QLabel {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLabel {{
+                font-family: {get_ui_text_font_family_css()};
                 color: #2c3e50;
                 border: none;
-            }
-            QTextEdit {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QTextEdit {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 11pt;
                 line-height: 1.4;
                 padding: 8px;
                 background-color: white;
                 border: none;
-            }
+            }}
         """)
         result_layout = QVBoxLayout(result_frame)
         result_layout.setSpacing(2)  # 减小组件间距
@@ -376,15 +376,15 @@ class ToolsPage(QWidget):
         # 创建结果文本展示区
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
-        self.result_text.setStyleSheet("""
-            QTextEdit {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+        self.result_text.setStyleSheet(f"""
+            QTextEdit {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 11pt;
                 line-height: 1.5;  /* 减小行高 */
                 padding: 10px;  /* 减小内边距 */
                 background-color: white;
                 border: none;
-            }
+            }}
         """)
         self.result_text.setMinimumHeight(300)  # 减小最小高度
         result_layout.addWidget(self.result_text)

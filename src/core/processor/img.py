@@ -18,10 +18,11 @@ class ImageProcessorThread(QThread):
     PREVIEW_WIDTH = 360
     PREVIEW_HEIGHT = 480
 
-    def __init__(self, cover_image_url, content_image_urls):
+    def __init__(self, cover_image_url, content_image_urls, referer_url: str = ""):
         super().__init__()
         self.cover_image_url = cover_image_url
         self.content_image_urls = content_image_urls
+        self.referer_url = str(referer_url or "").strip()
         # 获取用户主目录
         img_dir = os.path.join(os.path.expanduser('~'), '.xhs_system')
         if not os.path.exists(img_dir):
@@ -78,8 +79,25 @@ class ImageProcessorThread(QThread):
                     with open(local_path, 'rb') as f:
                         content = f.read()
                 else:
-                    # 添加SSL验证跳过和更长的超时时间
-                    response = requests.get(url, verify=False, timeout=30)
+                    # 添加SSL验证跳过和更长的超时时间；部分站点需要 UA/Referer 才能拉取图片
+                    headers = {
+                        "User-Agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    }
+                    if self.referer_url:
+                        headers["Referer"] = self.referer_url
+
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        verify=False,
+                        timeout=30,
+                        allow_redirects=True,
+                    )
                     if response.status_code != 200:
                         raise Exception(f"下载图片失败: HTTP {response.status_code}")
                     content = response.content

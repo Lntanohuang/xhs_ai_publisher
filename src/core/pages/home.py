@@ -1,16 +1,20 @@
-import sys
 import shutil
 import time
 
 from PyQt5.QtCore import Qt, QUrl
 from PyQt5.QtGui import QColor, QPixmap, QDesktopServices
 from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
-                             QPushButton, QTextEdit, QVBoxLayout, QWidget, QMessageBox, QComboBox, QFileDialog)
+                             QPushButton, QTextEdit, QVBoxLayout, QWidget, QMessageBox, QComboBox, QFileDialog, QInputDialog)
 
 import os
 from src.core.alert import TipWindow
+from src.core.pages.scheduled_publish_dialog import ScheduledPublishDialog
 from src.core.processor.content import ContentGeneratorThread
 from src.core.processor.img import ImageProcessorThread
+from src.core.processor.chrome_session_import import ChromeSessionImportThread
+from src.core.processor.wechat_import import WechatArticleImportThread
+from src.core.services.chrome_profile_service import detect_chrome_profiles
+from src.core.ui.qt_font import get_ui_text_font_family_css
 
 class HomePage(QWidget):
     """主页类"""
@@ -23,6 +27,7 @@ class HomePage(QWidget):
         self.images = []
         self.image_list = []
         self.current_image_index = 0
+        self.wechat_import_thread = None
         # 创建占位图
         self.placeholder_photo = QPixmap(360, 480)
         self.placeholder_photo.fill(QColor('#f8f9fa'))
@@ -50,25 +55,25 @@ class HomePage(QWidget):
     def create_login_section(self, parent_layout):
         """创建登录区域"""
         login_frame = QFrame()
-        login_frame.setStyleSheet("""
-            QFrame {
+        login_frame.setStyleSheet(f"""
+            QFrame {{
                 padding: 8px;
                 background-color: white;
-            }
-            QLabel {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLabel {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 12pt;
                 border: none;
                 background: transparent;
-            }
-            QLineEdit {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLineEdit {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 12pt;
-            }
-            QPushButton {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QPushButton {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 12pt;
-            }
+            }}
         """)
         login_layout = QVBoxLayout(login_frame)
         login_layout.setContentsMargins(8, 8, 8, 8)
@@ -93,6 +98,12 @@ class HomePage(QWidget):
         login_btn.clicked.connect(self.login)
         login_controls.addWidget(login_btn)
 
+        # 一键导入系统 Chrome 登录态（用于风控/扫码登录后复用）
+        self.chrome_import_btn = QPushButton("🧩 导入登录态")
+        self.chrome_import_btn.setFixedWidth(120)
+        self.chrome_import_btn.clicked.connect(self.import_chrome_session)
+        login_controls.addWidget(self.chrome_import_btn)
+
         # 添加免责声明
         disclaimer_label = QLabel("⚠️ 仅限于学习,请勿用于其他用途,否则后果自负")
         disclaimer_label.setStyleSheet("""
@@ -104,6 +115,13 @@ class HomePage(QWidget):
 
         login_controls.addStretch()
         login_layout.addLayout(login_controls)
+
+        # 登录/导入状态提示
+        self.login_status_label = QLabel("")
+        self.login_status_label.setStyleSheet(
+            "color: #7f8c8d; font-size: 10.5pt; padding-left: 2px;"
+        )
+        login_layout.addWidget(self.login_status_label)
         parent_layout.addWidget(login_frame)
 
     def create_left_section(self, parent_layout):
@@ -114,20 +132,20 @@ class HomePage(QWidget):
 
         # 标题编辑区域
         title_frame = QFrame()
-        title_frame.setStyleSheet("""
-            QFrame {
+        title_frame.setStyleSheet(f"""
+            QFrame {{
                 padding: 12px;
                 background-color: white;
-            }
-            QLabel {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLabel {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 11pt;
                 color: #2c3e50;
                 border: none;
                 background: transparent;
-            }
-            QLineEdit {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLineEdit {{
+                font-family: {get_ui_text_font_family_css()};
                 padding: 4px;
                 margin-bottom: 8px;
                 border: 1px solid #ddd;
@@ -135,13 +153,13 @@ class HomePage(QWidget):
                 background-color: white;
                 max-height: 24px;
                 min-width: 200px;
-            }
-            QLabel#section_title {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLabel#section_title {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 12pt;
                 font-weight: bold;
                 margin-bottom: 8px;
-            }
+            }}
         """)
         title_layout = QVBoxLayout(title_frame)
         title_layout.setSpacing(0)
@@ -214,37 +232,74 @@ class HomePage(QWidget):
 
         # 内容输入区域
         input_frame = QFrame()
-        input_frame.setStyleSheet("""
-            QFrame {
+        input_frame.setStyleSheet(f"""
+            QFrame {{
                 padding: 12px;
                 background-color: white;
                 margin-top: 8px;
-            }
-            QLabel {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLabel {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 12pt;
                 font-weight: bold;
                 color: #2c3e50;
                 margin-bottom: 8px;
                 border: none;
                 background: transparent;
-            }
-            QTextEdit {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QTextEdit {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 11pt;
                 line-height: 1.5;
                 padding: 8px;
                 border: 1px solid #ddd;
                 border-radius: 4px;
                 background-color: white;
-            }
-            QPushButton {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
-                min-width: 100px;
-                padding: 8px 15px;
+            }}
+            QPushButton {{
+                font-family: {get_ui_text_font_family_css()};
+                padding: 6px 10px;
                 font-weight: bold;
+                margin-top: 0px;
+            }}
+            QPushButton#generate_btn {{
+                min-width: 200px;
+                padding: 8px 16px;
                 margin-top: 10px;
-            }
+                background-color: #4a90e2;
+                color: white;
+                border: none;
+                border-radius: 10px;
+            }}
+            QPushButton#generate_btn:hover {{
+                background-color: #357abd;
+            }}
+            QPushButton#mini_btn {{
+                min-width: 0px;
+                padding: 6px 10px;
+                margin-top: 0px;
+                background-color: #f3f4f6;
+                color: #111827;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                font-weight: 600;
+            }}
+            QPushButton#mini_btn:hover {{
+                background-color: #e5e7eb;
+            }}
+            QPushButton#mini_primary_btn {{
+                min-width: 0px;
+                padding: 6px 12px;
+                margin-top: 0px;
+                background-color: #4a90e2;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                font-weight: 700;
+            }}
+            QPushButton#mini_primary_btn:hover {{
+                background-color: #357abd;
+            }}
         """)
         input_layout = QVBoxLayout(input_frame)
         input_layout.setSpacing(0)
@@ -264,25 +319,51 @@ class HomePage(QWidget):
         hotspot_row.setContentsMargins(0, 0, 0, 8)
         hotspot_row.setSpacing(8)
 
-        hotspot_row.addWidget(QLabel("🔥 热点:"))
+        hotspot_label = QLabel("🔥 热点:")
+        hotspot_label.setFixedWidth(90)
+        hotspot_row.addWidget(hotspot_label)
         self.hotspot_combo = QComboBox()
         self.hotspot_combo.setMinimumWidth(260)
         self.hotspot_combo.currentIndexChanged.connect(self.on_hotspot_selected)
         hotspot_row.addWidget(self.hotspot_combo, 1)
 
-        refresh_hot_btn = QPushButton("🔄")
-        refresh_hot_btn.setToolTip("从缓存刷新热点列表")
-        refresh_hot_btn.setFixedWidth(46)
-        refresh_hot_btn.clicked.connect(self.refresh_hotspot_options)
-        hotspot_row.addWidget(refresh_hot_btn)
-
-        open_hot_btn = QPushButton("📊")
-        open_hot_btn.setToolTip("打开数据中心查看热榜")
-        open_hot_btn.setFixedWidth(46)
+        open_hot_btn = QPushButton("📊 热榜")
+        open_hot_btn.setObjectName("mini_btn")
+        open_hot_btn.setToolTip("打开数据中心查看热榜（刷新请在数据中心进行）")
+        open_hot_btn.setFixedHeight(32)
         open_hot_btn.clicked.connect(self.open_data_center)
         hotspot_row.addWidget(open_hot_btn)
 
         input_container_layout.addLayout(hotspot_row)
+
+        # 链接导入（解析标题/正文/图片，自动填充到小红书草稿）
+        wechat_row = QHBoxLayout()
+        wechat_row.setContentsMargins(0, 0, 0, 8)
+        wechat_row.setSpacing(8)
+        wechat_label = QLabel("🔗 导入:")
+        wechat_label.setFixedWidth(90)
+        wechat_row.addWidget(wechat_label)
+
+        self.wechat_url_input = QLineEdit()
+        self.wechat_url_input.setPlaceholderText("粘贴网页链接（支持公众号/通用网页，效果视站点而定）")
+        try:
+            self.wechat_url_input.setClearButtonEnabled(True)
+        except Exception:
+            pass
+        wechat_row.addWidget(self.wechat_url_input, 1)
+
+        self.wechat_import_btn = QPushButton("📥 导入")
+        self.wechat_import_btn.setObjectName("mini_primary_btn")
+        self.wechat_import_btn.setToolTip("从链接导入标题/正文/图片（公众号/通用网页）")
+        self.wechat_import_btn.setFixedHeight(32)
+        self.wechat_import_btn.clicked.connect(self.import_wechat_article)
+        wechat_row.addWidget(self.wechat_import_btn)
+
+        input_container_layout.addLayout(wechat_row)
+
+        self.wechat_status_label = QLabel("")
+        self.wechat_status_label.setStyleSheet("color: #6b7280; font-size: 10.5pt; font-weight: normal;")
+        input_container_layout.addWidget(self.wechat_status_label)
 
         # 添加输入框
         self.input_text = QTextEdit()
@@ -298,10 +379,45 @@ class HomePage(QWidget):
 
         # 将生成按钮保存为类属性
         self.generate_btn = QPushButton("✨ 生成内容")
+        self.generate_btn.setObjectName("generate_btn")
         self.generate_btn.clicked.connect(self.generate_content)
         button_layout.addWidget(self.generate_btn)
 
         input_container_layout.addLayout(button_layout)
+
+        # 避免生成中（按钮文案变长/高DPI）出现文字被截断：按“最长状态文案”的 sizeHint 动态设定最小宽度
+        try:
+            from PyQt5.QtWidgets import QSizePolicy
+
+            self.generate_btn.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+        except Exception:
+            pass
+
+        try:
+            self.generate_btn.ensurePolished()
+            candidates = [
+                "✨ 生成内容",
+                "⏳ 接口生成中...",
+                "🤖 AI生成中...",
+                "⏳ 本地生成中...",
+                "🪧 生成营销海报中...",
+                "⏳ 重试中(99/99)...",
+            ]
+            original_text = self.generate_btn.text()
+            max_w = 0
+            for t in candidates:
+                self.generate_btn.setText(t)
+                max_w = max(max_w, int(self.generate_btn.sizeHint().width() or 0))
+            self.generate_btn.setText(original_text)
+
+            if max_w > 0:
+                self.generate_btn.setMinimumWidth(max(200, max_w + 8))
+        except Exception:
+            try:
+                self.generate_btn.setMinimumWidth(240)
+            except Exception:
+                pass
+
         input_layout.addWidget(input_container)
 
         # 初次加载热点（不阻塞网络：只读取缓存；刷新请去数据中心）
@@ -318,38 +434,38 @@ class HomePage(QWidget):
     def create_preview_section(self, parent_layout):
         """创建预览区域"""
         preview_frame = QFrame()
-        preview_frame.setStyleSheet("""
-            QFrame {
+        preview_frame.setStyleSheet(f"""
+            QFrame {{
                 padding: 15px;
                 background-color: white;
                 border: 1px solid #e1e4e8;
                 border-radius: 8px;
-            }
-            QLabel {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QLabel {{
+                font-family: {get_ui_text_font_family_css()};
                 font-size: 11pt;
                 color: #2c3e50;
                 border: none;
                 background: transparent;
-            }
-            QWidget#image_container {
+            }}
+            QWidget#image_container {{
                 background-color: white;
-            }
-            QPushButton {
-                font-family: """ + ("Menlo" if sys.platform == "darwin" else "Consolas") + """;
+            }}
+            QPushButton {{
+                font-family: {get_ui_text_font_family_css()};
                 padding: 15px;
                 font-weight: bold;
                 border-radius: 20px;
                 background-color: rgba(74, 144, 226, 0.1);
                 color: #4a90e2;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: rgba(74, 144, 226, 0.2);
-            }
-            QPushButton:disabled {
+            }}
+            QPushButton:disabled {{
                 background-color: #f5f5f5;
                 color: #aaa;
-            }
+            }}
         """)
         preview_layout = QVBoxLayout(preview_frame)
         preview_layout.setSpacing(15)
@@ -464,6 +580,31 @@ class HomePage(QWidget):
         preview_btn.setEnabled(False)
         preview_layout.addWidget(
             preview_btn, alignment=Qt.AlignCenter)
+
+        # 添加定时发布按钮
+        self.schedule_btn = QPushButton("⏰ 定时发布")
+        self.schedule_btn.setObjectName("schedule_btn")
+        self.schedule_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 15px;
+                font-size: 12pt;
+                background-color: #FF2442;
+                color: white;
+                border: none;
+                border-radius: 15px;
+                margin-top: 8px;
+            }
+            QPushButton:hover {
+                background-color: #E91E63;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.schedule_btn.setToolTip("创建定时发布任务（支持固定内容/跟随热点）")
+        self.schedule_btn.clicked.connect(self.schedule_publish)
+        self.schedule_btn.setEnabled(True)
+        preview_layout.addWidget(self.schedule_btn, alignment=Qt.AlignCenter)
 
         # 初始化时禁用按钮
         self.prev_btn.setEnabled(False)
@@ -609,6 +750,254 @@ class HomePage(QWidget):
         except Exception:
             pass
 
+    def import_wechat_article(self):
+        """从链接导入标题/正文/图片。"""
+        try:
+            if not hasattr(self, "wechat_url_input") or self.wechat_url_input is None:
+                return
+
+            url = str(self.wechat_url_input.text() or "").strip()
+            if not url:
+                TipWindow(self.parent, "❌ 请输入网页链接").show()
+                return
+
+            # 按钮与状态提示
+            if hasattr(self, "wechat_import_btn") and self.wechat_import_btn is not None:
+                self.wechat_import_btn.setEnabled(False)
+                self.wechat_import_btn.setText("⏳ 导入中")
+            if hasattr(self, "wechat_status_label") and self.wechat_status_label is not None:
+                self.wechat_status_label.setText("⏳ 准备导入...")
+
+            self.wechat_import_thread = WechatArticleImportThread(url, max_images=9)
+            self.wechat_import_thread.progress.connect(self.handle_wechat_import_progress)
+            self.wechat_import_thread.finished.connect(self.handle_wechat_import_finished)
+            self.wechat_import_thread.error.connect(self.handle_wechat_import_error)
+            self.wechat_import_thread.start()
+
+        except Exception as e:
+            TipWindow(self.parent, f"❌ 导入失败: {str(e)}").show()
+            try:
+                if hasattr(self, "wechat_import_btn") and self.wechat_import_btn is not None:
+                    self.wechat_import_btn.setEnabled(True)
+                    self.wechat_import_btn.setText("📥 导入")
+            except Exception:
+                pass
+
+    def handle_wechat_import_progress(self, msg: str):
+        try:
+            if hasattr(self, "wechat_status_label") and self.wechat_status_label is not None:
+                self.wechat_status_label.setText(str(msg or "").strip())
+        except Exception:
+            pass
+
+    def handle_wechat_import_finished(self, data: dict):
+        try:
+            # 恢复按钮
+            if hasattr(self, "wechat_import_btn") and self.wechat_import_btn is not None:
+                self.wechat_import_btn.setEnabled(True)
+                self.wechat_import_btn.setText("📥 导入")
+
+            title = str((data or {}).get("title") or "").strip()
+            content = str((data or {}).get("content") or "").strip()
+            author = str((data or {}).get("author") or "").strip()
+            image_urls = (data or {}).get("image_urls") or []
+
+            # 简单截断：避免超长内容导致发布页输入异常（用户仍可手动编辑）
+            max_len = 1000
+            if content and len(content) > max_len:
+                content = content[:max_len].rstrip() + "\n\n（已自动截断，原文更长）"
+
+            if title:
+                self.title_input.setText(title)
+            if content:
+                self.subtitle_input.setText(content)
+            if author and hasattr(self, "author_input") and self.author_input is not None:
+                # 仅在作者输入框为空时填充，避免覆盖用户自定义
+                if not str(self.author_input.text() or "").strip():
+                    self.author_input.setText(author)
+
+            # 主题输入框也填一下，便于后续继续生成/改写
+            try:
+                if hasattr(self, "input_text") and self.input_text is not None:
+                    self.input_text.setPlainText(title or "")
+            except Exception:
+                pass
+
+            if hasattr(self, "wechat_status_label") and self.wechat_status_label is not None:
+                img_count = len(image_urls) if isinstance(image_urls, (list, tuple)) else 0
+                self.wechat_status_label.setText(f"✅ 导入完成（图片 {img_count} 张）")
+
+            # 没图时不启动预览加载（小红书图文发布需要图片）
+            if not isinstance(image_urls, (list, tuple)) or not image_urls:
+                self.images = []
+                self.image_list = []
+                self.current_image_index = 0
+                self.image_label.setPixmap(self.placeholder_photo)
+                self.image_title.setText("未解析到图片，请手动选择图片或改用模板生成")
+                self.parent.update_preview_button("🎯 预览发布", False)
+                TipWindow(self.parent, "⚠️ 未解析到图片（小红书图文发布需要图片）").show()
+                return
+
+            cover_image_url = str(image_urls[0] or "").strip()
+            content_image_urls = [str(u or "").strip() for u in list(image_urls[1:]) if str(u or "").strip()]
+            referer_url = str((data or {}).get("url") or "").strip()
+
+            # 启动图片处理线程（下载+预览）
+            self.parent.image_processor = ImageProcessorThread(
+                cover_image_url,
+                content_image_urls,
+                referer_url=referer_url,
+            )
+            self.parent.image_processor.finished.connect(self.handle_image_processing_result)
+            self.parent.image_processor.error.connect(self.handle_image_processing_error)
+            self.parent.image_processor.start()
+
+            # 清空旧图片列表并显示占位图
+            self.images = []
+            self.image_list = []
+            self.current_image_index = 0
+            self.image_label.setPixmap(self.placeholder_photo)
+            self.image_title.setText("正在加载图片...")
+            self.parent.update_preview_button("🎯 预览发布", False)
+
+        except Exception as e:
+            self.handle_wechat_import_error(str(e))
+
+    def handle_wechat_import_error(self, error_msg: str):
+        try:
+            if hasattr(self, "wechat_import_btn") and self.wechat_import_btn is not None:
+                self.wechat_import_btn.setEnabled(True)
+                self.wechat_import_btn.setText("📥 导入")
+            if hasattr(self, "wechat_status_label") and self.wechat_status_label is not None:
+                self.wechat_status_label.setText("")
+        except Exception:
+            pass
+        TipWindow(self.parent, f"❌ 链接导入失败: {str(error_msg or '').strip()}").show()
+
+    def import_chrome_session(self):
+        """一键导入系统 Chrome 中的小红书登录态（cookies + localStorage）。"""
+        try:
+            phone = (self.phone_input.text() or "").strip()
+            if not phone:
+                TipWindow(self.parent, "❌ 请输入手机号（用于绑定到当前用户数据目录）").show()
+                return
+
+            # 提示用户退出 Chrome，避免 Profile lock
+            ret = QMessageBox.question(
+                self,
+                "导入系统 Chrome 登录态",
+                "导入会临时打开你的系统 Chrome Profile 读取登录态。\n\n"
+                "注意：请先完全退出 Chrome（macOS：Cmd+Q），否则可能导入失败。\n\n"
+                "导入完成后，本项目会保存一份仅包含 xiaohongshu.com 的登录态文件。\n\n"
+                "继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+            detected = detect_chrome_profiles()
+            if not detected or not detected.profiles:
+                TipWindow(
+                    self.parent,
+                    "❌ 未检测到系统 Chrome Profile。\n"
+                    "请确认已安装 Chrome，或在项目根目录 .env 设置：\n"
+                    "  XHS_CHROME_USER_DATA_DIR=...（Chrome User Data 目录）\n"
+                    "  XHS_CHROME_PROFILE_DIRECTORY=Default/Profile 1 ...",
+                ).show()
+                return
+
+            profile_dir = (detected.default_profile_directory or "Default").strip() or "Default"
+            if len(detected.profiles) > 1:
+                items = []
+                mapping = {}
+                for p in detected.profiles:
+                    label = f"{(p.name or p.directory).strip()} ({p.directory})"
+                    items.append(label)
+                    mapping[label] = p.directory
+                try:
+                    current_index = items.index(next(i for i in items if mapping.get(i) == profile_dir))
+                except Exception:
+                    current_index = 0
+
+                selected, ok = QInputDialog.getItem(
+                    self,
+                    "选择 Chrome Profile",
+                    "请选择要导入的 Chrome 配置文件：",
+                    items,
+                    current_index,
+                    False,
+                )
+                if not ok:
+                    return
+                profile_dir = mapping.get(selected, profile_dir)
+
+            # UI 状态
+            try:
+                if hasattr(self, "chrome_import_btn") and self.chrome_import_btn is not None:
+                    self.chrome_import_btn.setEnabled(False)
+                    self.chrome_import_btn.setText("⏳ 导入中...")
+                if hasattr(self, "login_status_label") and self.login_status_label is not None:
+                    self.login_status_label.setText("⏳ 正在导入系统 Chrome 登录态...")
+                self.parent.update_login_button("🚀 登录", False)
+            except Exception:
+                pass
+
+            # 启动线程
+            self.chrome_import_thread = ChromeSessionImportThread(
+                phone=phone,
+                chrome_user_data_dir=detected.user_data_dir,
+                chrome_profile_directory=profile_dir,
+                timeout_s=300,
+            )
+            self.chrome_import_thread.progress.connect(self._on_chrome_import_progress)
+            self.chrome_import_thread.finished.connect(self._on_chrome_import_finished)
+            self.chrome_import_thread.error.connect(self._on_chrome_import_error)
+            self.chrome_import_thread.start()
+        except Exception as e:
+            TipWindow(self.parent, f"❌ 导入失败: {str(e)}").show()
+
+    def _on_chrome_import_progress(self, msg: str):
+        try:
+            if hasattr(self, "login_status_label") and self.login_status_label is not None:
+                self.login_status_label.setText(str(msg or "").strip())
+        except Exception:
+            pass
+
+    def _on_chrome_import_finished(self, result: dict):
+        try:
+            if hasattr(self, "chrome_import_btn") and self.chrome_import_btn is not None:
+                self.chrome_import_btn.setEnabled(True)
+                self.chrome_import_btn.setText("🧩 导入登录态")
+            self.parent.update_login_button("🚀 登录", True)
+
+            if hasattr(self, "login_status_label") and self.login_status_label is not None:
+                self.login_status_label.setText("✅ 已导入登录态：现在点“登录”尝试复用（如仍触发风控，请按页面提示完成）。")
+        except Exception:
+            pass
+        TipWindow(self.parent, "✅ 已导入系统 Chrome 登录态，下一步点“登录”尝试复用").show()
+
+    def _on_chrome_import_error(self, err: str):
+        try:
+            if hasattr(self, "chrome_import_btn") and self.chrome_import_btn is not None:
+                self.chrome_import_btn.setEnabled(True)
+                self.chrome_import_btn.setText("🧩 导入登录态")
+            self.parent.update_login_button("🚀 登录", True)
+
+            if hasattr(self, "login_status_label") and self.login_status_label is not None:
+                self.login_status_label.setText(f"❌ 导入失败：{str(err or '').strip()}")
+        except Exception:
+            pass
+        try:
+            print(f"❌ Chrome 登录态导入失败: {str(err or '').strip()}")
+        except Exception:
+            pass
+        try:
+            QMessageBox.critical(self, "导入失败", str(err or "").strip() or "未知错误")
+        except Exception:
+            pass
+        TipWindow(self.parent, f"❌ 导入失败: {str(err or '').strip()}").show()
+
     def login(self):
         try:
             phone = self.phone_input.text()
@@ -688,10 +1077,20 @@ class HomePage(QWidget):
         print(f"错误信息: {error_message}")
 
         # 根据错误类型提供具体的用户友好提示
-        if "远程工作流执行失败" in error_message or "Workflow code node function execution failed" in error_message:
+        if "模型配置不可用" in error_message or "LLMServiceError" in error_message:
             user_message = (
-                "❌ 默认接口生成失败\n\n"
-                "远程工作流执行失败，请检查工作流代码或在 debug_url 中查看详情。\n"
+                "⚠️ 大模型未配置或不可用\n\n"
+                "请在「模型设置」里填写模型端点与模型名称（本地模型可不填 key）。\n\n"
+                "你也可以先用「本地备用生成」继续生成。\n"
+            )
+        elif "本地备用生成器" in error_message and "失败" in error_message:
+            user_message = (
+                "⚠️ 本地生成失败\n\n"
+                "本地备用生成器遇到问题。\n\n"
+                "可能的解决方案：\n"
+                "• 重启应用程序\n"
+                "• 尝试简化输入内容\n"
+                "• 检查磁盘权限（~/.xhs_system 是否可写）\n"
             )
         elif "主API和备用生成器都失败了" in error_message:
             user_message = (
@@ -703,66 +1102,13 @@ class HomePage(QWidget):
                 "• 尝试简化输入内容\n"
                 "• 重启应用程序"
             )
-        elif "网络连接失败" in error_message:
-            user_message = (
-                "🌐 网络连接失败\n\n"
-                "无法连接到内容生成服务。\n\n"
-                "解决方案：\n"
-                "• 检查网络连接是否正常\n"
-                "• 确认防火墙设置允许应用访问网络\n"
-                "• 尝试切换网络环境\n"
-            )
-        elif "API请求超时" in error_message:
-            user_message = (
-                "⏰ 请求超时\n\n"
-                "服务器响应时间过长。\n\n"
-                "解决方案：\n"
-                "• 检查网络速度\n"
-                "• 尝试减少输入内容的长度\n"
-                "• 稍后重试\n"
-            )
-        elif "状态码: 404" in error_message:
-            user_message = (
-                "🔍 服务不可用\n\n"
-                "内容生成服务接口不存在或已更改。\n\n"
-                "解决方案：\n"
-                "• 检查应用是否为最新版本\n"
-                "• 联系技术支持获取帮助\n"
-            )
-        elif "状态码: 500" in error_message:
-            user_message = (
-                "🔧 服务器错误\n\n"
-                "内容生成服务遇到内部错误。\n\n"
-                "解决方案：\n"
-                "• 稍后重试，问题可能是临时的\n"
-                "• 如果问题持续，请联系技术支持\n"
-            )
-        elif "状态码: 400" in error_message:
-            user_message = (
-                "📝 请求格式错误\n\n"
-                "请求参数可能有误或API格式已更改。\n\n"
-                "解决方案：\n"
-                "• 检查输入内容是否包含特殊字符\n"
-                "• 尝试简化输入内容\n"
-                "• 确保应用为最新版本\n"
-            )
         elif "JSON解析失败" in error_message:
             user_message = (
                 "📊 数据解析错误\n\n"
-                "服务器返回的数据格式异常。\n\n"
+                "模型返回的数据格式异常。\n\n"
                 "解决方案：\n"
                 "• 重试操作\n"
-                "• 如果问题持续，请联系技术支持\n"
-            )
-        elif "备用生成器" in error_message and "失败" in error_message:
-            user_message = (
-                "⚠️ 备用生成器错误\n\n"
-                "本地备用内容生成器遇到问题。\n\n"
-                "解决方案：\n"
-                "• 重启应用程序\n"
-                "• 检查输入内容是否过长或包含特殊字符\n"
-                "• 尝试简化输入内容\n"
-                "• 联系技术支持获取帮助"
+                "• 尝试更换提示词模板\n"
             )
         else:
             user_message = (
@@ -789,35 +1135,53 @@ class HomePage(QWidget):
 
     def update_ui_after_generate(self, title, content, cover_image_url, content_image_urls, input_text, content_pages=None):
         try:
-            # 若用户已在“封面模板库”选择了模板，则用同一模板生成封面 + 内容页
+            # 优先使用系统模板生成封面 + 内容页（观感更统一）；如用户在“封面模板库”选择了模板，则使用该背景
             try:
                 from src.config.config import Config
                 from src.core.services.system_image_template_service import system_image_template_service
 
                 tpl_id = (Config().get_templates_config().get("selected_cover_template_id") or "").strip()
+                bg_path = ""
                 if tpl_id and tpl_id != "showcase_marketing_poster":
                     showcase_dir = system_image_template_service.resolve_showcase_dir()
-                    bg_path = None
                     if showcase_dir:
                         candidate = showcase_dir / f"{tpl_id}.png"
                         if candidate.exists():
                             bg_path = str(candidate)
 
-                    if bg_path and os.path.exists(bg_path):
-                        # 页数优先取文案分页（大模型/默认服务返回 list / content_pages）
-                        page_count = 3
-                        if isinstance(content_pages, (list, tuple)) and content_pages:
-                            page_count = max(1, len(content_pages))
+                # 页数优先取文案分页（大模型/默认服务返回 list / content_pages）
+                page_count = 3
+                if isinstance(content_pages, (list, tuple)) and content_pages:
+                    page_count = max(1, len(content_pages))
 
-                        generated = system_image_template_service.generate_post_images(
-                            title=title or "",
-                            content=content or "",
-                            content_pages=content_pages if isinstance(content_pages, (list, tuple)) else None,
-                            page_count=page_count,
-                            cover_bg_image_path=bg_path,
-                        )
-                        if generated:
-                            cover_image_url, content_image_urls = generated
+                generated = None
+                if bg_path and os.path.exists(bg_path):
+                    # 仅将“封面模板库”背景用于封面；内容页仍使用系统内容模板包，
+                    # 避免用封面背景渲染内容页导致文字不可读/像空白。
+                    generated = system_image_template_service.generate_post_images(
+                        title=title or "",
+                        content=content or "",
+                        content_pages=content_pages if isinstance(content_pages, (list, tuple)) else None,
+                        page_count=page_count,
+                        cover_bg_image_path=bg_path,
+                    )
+
+                # 未选择封面背景或生成失败：使用系统默认内容模板包生成（比远程图片更“卡片化”）
+                if not generated:
+                    generated = system_image_template_service.generate_post_images(
+                        title=title or "",
+                        content=content or "",
+                        content_pages=content_pages if isinstance(content_pages, (list, tuple)) else None,
+                        page_count=page_count,
+                    )
+
+                if generated:
+                    new_cover, new_contents = generated
+                    new_cover = str(new_cover or "").strip()
+                    new_contents = [str(x or "").strip() for x in (new_contents or []) if str(x or "").strip()]
+                    # 避免用“空内容页”覆盖掉已有图片（会导致只剩封面，看起来像内容页空白）
+                    if new_cover and new_contents:
+                        cover_image_url, content_image_urls = new_cover, new_contents
             except Exception as e:
                 print(f"⚠️ 使用封面模板生成封面失败，已回退原封面: {e}")
 
@@ -943,6 +1307,128 @@ class HomePage(QWidget):
 
         except Exception as e:
             TipWindow(self.parent, f"❌ 预览发布失败: {str(e)}").show()
+
+    def schedule_publish(self):
+        """创建定时发布任务（无人值守自动发布）。"""
+        try:
+            # 只允许选择“已登录”的用户（无人值守避免验证码）
+            try:
+                from src.core.services.user_service import user_service
+
+                current_user = user_service.get_current_user()
+                users = [u for u in user_service.list_users(active_only=True) if getattr(u, "is_logged_in", False)]
+            except Exception:
+                users = []
+                current_user = None
+
+            if not users:
+                TipWindow(self.parent, "❌ 没有已登录用户，请先登录后再创建定时任务").show()
+                return
+
+            default_user_id = getattr(current_user, "id", None) if current_user else getattr(users[0], "id", None)
+
+            # 默认重复间隔取后台配置的 interval_hours
+            default_interval_hours = 2
+            try:
+                default_interval_hours = int(self.parent.config.get_schedule_config().get("interval_hours", 2) or 2)
+            except Exception:
+                default_interval_hours = 2
+
+            dialog = ScheduledPublishDialog(
+                self,
+                users=users,
+                default_user_id=default_user_id,
+                default_interval_hours=default_interval_hours,
+                initial_title=(self.title_input.text() or "").strip(),
+                initial_content=(self.subtitle_input.toPlainText() or "").strip(),
+                initial_images=list(getattr(self, "images", None) or []),
+            )
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                return
+
+            user_id = dialog.get_user_id()
+            schedule_time = dialog.get_schedule_time()
+            if not user_id:
+                TipWindow(self.parent, "❌ 请选择发布账号").show()
+                return
+
+            if not hasattr(schedule_time, "isoformat"):
+                TipWindow(self.parent, "❌ 发布时间无效").show()
+                return
+
+            from src.core.scheduler.schedule_manager import schedule_manager
+
+            task_type = dialog.get_task_type()
+
+            if task_type == "hotspot":
+                source = dialog.get_hotspot_source()
+                rank = dialog.get_hotspot_rank()
+                interval_hours = dialog.get_interval_hours()
+                use_ctx = dialog.get_use_hotspot_context()
+
+                # 保存当前选择的封面模板（用于生成图片风格）；若为空则用占位图
+                cover_template_id = ""
+                try:
+                    cover_template_id = str(self.parent.config.get_templates_config().get("selected_cover_template_id") or "").strip()
+                except Exception:
+                    cover_template_id = ""
+
+                task_id = schedule_manager.add_task(
+                    content="",
+                    schedule_time=schedule_time,
+                    title=f"热点({source}) #{rank}",
+                    images=[],
+                    user_id=int(user_id),
+                    task_type="hotspot",
+                    interval_hours=int(interval_hours),
+                    hotspot_source=str(source),
+                    hotspot_rank=int(rank),
+                    use_hotspot_context=bool(use_ctx),
+                    cover_template_id=cover_template_id,
+                    page_count=3,
+                )
+            else:
+                title = dialog.get_fixed_title()
+                content = dialog.get_fixed_content()
+                images = dialog.get_fixed_images()
+
+                if not title and not content:
+                    TipWindow(self.parent, "❌ 请输入标题或正文").show()
+                    return
+
+                cover_template_id = ""
+                try:
+                    cover_template_id = str(self.parent.config.get_templates_config().get("selected_cover_template_id") or "").strip()
+                except Exception:
+                    cover_template_id = ""
+
+                task_id = schedule_manager.add_task(
+                    content=content,
+                    schedule_time=schedule_time,
+                    title=title,
+                    images=images,
+                    user_id=int(user_id),
+                    task_type="fixed",
+                    cover_template_id=cover_template_id,
+                    page_count=3,
+                )
+
+            try:
+                ts = schedule_time.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                ts = str(schedule_time)
+
+            TipWindow(self.parent, f"✅ 已创建定时任务：{ts}\n任务ID: {task_id}").show()
+
+            # 若配置页存在任务列表，尽量刷新
+            try:
+                if hasattr(self.parent, "backend_config_page") and hasattr(self.parent.backend_config_page, "refresh_schedule_tasks"):
+                    self.parent.backend_config_page.refresh_schedule_tasks()
+            except Exception:
+                pass
+
+        except Exception as e:
+            TipWindow(self.parent, f"❌ 创建定时任务失败: {str(e)}").show()
 
     def handle_preview_result(self):
         # 恢复预览按钮状态

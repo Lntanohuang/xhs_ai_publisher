@@ -9,11 +9,15 @@
 from __future__ import annotations
 
 import os
+import shutil
+import uuid
+from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap
 from PyQt5.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -97,6 +101,44 @@ class CoverTemplateLibraryTab(QWidget):
         self.meta_label.setStyleSheet("color: #374151; font-size: 13px;")
         right_layout.addWidget(self.meta_label)
 
+        # 营销海报素材选择（仅当选择 showcase_marketing_poster 时显示）
+        self.marketing_asset_box = QWidget()
+        asset_layout = QVBoxLayout(self.marketing_asset_box)
+        asset_layout.setContentsMargins(0, 0, 0, 0)
+        asset_layout.setSpacing(6)
+
+        asset_title = QLabel("🖼️ 营销海报素材（透明 PNG，可选）")
+        asset_title.setStyleSheet("color: #111827; font-size: 13px; font-weight: bold;")
+        asset_layout.addWidget(asset_title)
+
+        asset_row = QHBoxLayout()
+        asset_row.setSpacing(10)
+
+        self.asset_thumb = QLabel("PNG")
+        self.asset_thumb.setFixedSize(56, 56)
+        self.asset_thumb.setAlignment(Qt.AlignCenter)
+        self.asset_thumb.setStyleSheet(
+            "QLabel { background: #ffffff; border: 1px dashed #e5e7eb; border-radius: 10px; color: #6b7280; }"
+        )
+        asset_row.addWidget(self.asset_thumb)
+
+        self.asset_path_label = QLabel("未选择")
+        self.asset_path_label.setWordWrap(True)
+        self.asset_path_label.setStyleSheet("color: #374151; font-size: 12px;")
+        asset_row.addWidget(self.asset_path_label, 1)
+
+        self.select_asset_btn = QPushButton("选择素材")
+        self.select_asset_btn.clicked.connect(self.select_marketing_asset)
+        asset_row.addWidget(self.select_asset_btn)
+
+        self.clear_asset_btn = QPushButton("清除")
+        self.clear_asset_btn.clicked.connect(self.clear_marketing_asset)
+        asset_row.addWidget(self.clear_asset_btn)
+
+        asset_layout.addLayout(asset_row)
+        self.marketing_asset_box.setVisible(False)
+        right_layout.addWidget(self.marketing_asset_box)
+
         apply_btn = QPushButton("✅ 应用到首页")
         apply_btn.setStyleSheet(
             "QPushButton { background-color: #FF2442; color: white; border: none; padding: 10px 14px; border-radius: 8px; font-weight: bold; }"
@@ -149,7 +191,7 @@ class CoverTemplateLibraryTab(QWidget):
             self.template_list.addItem(empty)
             return
 
-        # 默认：不选封面模板，走远程接口生成封面/内容图
+        # 默认：不选封面模板，使用内置/系统模板生成封面与内容图
         default_tpl = {
             "id": "",
             "display": "默认",
@@ -186,6 +228,13 @@ class CoverTemplateLibraryTab(QWidget):
             return
 
         self._current_template = data
+        is_marketing = str(data.get("id") or "").strip() == "showcase_marketing_poster"
+        try:
+            self.marketing_asset_box.setVisible(is_marketing)
+        except Exception:
+            pass
+        if is_marketing:
+            self._sync_marketing_asset_ui()
         meta = data.get("display") or data.get("id") or "模板"
         category = data.get("category") or ""
         suffix = f" · {category}" if category else ""
@@ -209,6 +258,104 @@ class CoverTemplateLibraryTab(QWidget):
             self.preview_label.setText("")
         else:
             self.preview_label.setText("模板文件不存在")
+
+    @staticmethod
+    def _marketing_asset_dir() -> Path:
+        return Path(os.path.expanduser("~")) / ".xhs_system" / "marketing_poster_assets"
+
+    def _load_marketing_asset_path(self) -> str:
+        try:
+            path = str(Config().get_templates_config().get("marketing_poster_asset_path") or "").strip()
+        except Exception:
+            path = ""
+        path = os.path.expanduser(path) if path else ""
+        if path and os.path.exists(path):
+            return path
+        return ""
+
+    def _sync_marketing_asset_ui(self) -> None:
+        path = self._load_marketing_asset_path()
+        if path:
+            basename = os.path.basename(path)
+            self.asset_path_label.setText(basename)
+            self.asset_path_label.setToolTip(path)
+            self.clear_asset_btn.setEnabled(True)
+            try:
+                pixmap = QPixmap(path)
+                scaled = pixmap.scaled(56, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.asset_thumb.setPixmap(scaled)
+                self.asset_thumb.setText("")
+            except Exception:
+                self.asset_thumb.setPixmap(QPixmap())
+                self.asset_thumb.setText("PNG")
+        else:
+            self.asset_path_label.setText("未选择（透明底 PNG）")
+            self.asset_path_label.setToolTip("")
+            self.clear_asset_btn.setEnabled(False)
+            self.asset_thumb.setPixmap(QPixmap())
+            self.asset_thumb.setText("PNG")
+
+    def select_marketing_asset(self) -> None:
+        """选择营销海报素材（透明底 PNG），并保存到配置。"""
+        current = self._load_marketing_asset_path()
+        initial_dir = os.path.dirname(current) if current else str(self._marketing_asset_dir())
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择营销海报素材（透明 PNG）",
+            initial_dir,
+            "PNG 图片 (*.png);;所有文件 (*)",
+        )
+        file_path = str(file_path or "").strip()
+        if not file_path:
+            return
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "提示", "选择的文件不存在")
+            return
+
+        asset_dir = self._marketing_asset_dir()
+        try:
+            asset_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"创建素材目录失败: {e}")
+            return
+
+        suffix = Path(file_path).suffix.lower() or ".png"
+        if suffix != ".png":
+            suffix = ".png"
+        target = asset_dir / f"asset_{uuid.uuid4().hex[:8]}{suffix}"
+
+        try:
+            shutil.copy2(file_path, target)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"复制素材失败: {e}")
+            return
+
+        try:
+            cfg = Config()
+            templates_cfg = cfg.get_templates_config()
+            templates_cfg["marketing_poster_asset_path"] = str(target)
+            cfg.update_templates_config(templates_cfg)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"保存素材选择失败: {e}")
+            return
+
+        self._sync_marketing_asset_ui()
+        try:
+            TipWindow(self.parent() if self.parent() else self, "✅ 已选择营销海报素材").show()
+        except Exception:
+            pass
+
+    def clear_marketing_asset(self) -> None:
+        """清除营销海报素材选择。"""
+        try:
+            cfg = Config()
+            templates_cfg = cfg.get_templates_config()
+            templates_cfg["marketing_poster_asset_path"] = ""
+            cfg.update_templates_config(templates_cfg)
+        except Exception:
+            pass
+        self._sync_marketing_asset_ui()
 
     def apply_current_template(self):
         if not self._current_template:

@@ -463,6 +463,71 @@ class MarketingPosterService:
         self.fonts = PosterFontResolver()
 
     @staticmethod
+    def _load_asset_rgba(path: str) -> Optional[Image.Image]:
+        try:
+            with Image.open(path) as im:
+                img = im.convert("RGBA")
+            img.load()
+            return img
+        except Exception:
+            return None
+
+    @staticmethod
+    def _resize_to_contain(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
+        dst_w, dst_h = target_size
+        src_w, src_h = img.size
+        if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+            return img
+        scale = min(dst_w / src_w, dst_h / src_h)
+        new_w = max(1, int(round(src_w * scale)))
+        new_h = max(1, int(round(src_h * scale)))
+        if (new_w, new_h) == img.size:
+            return img
+        return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    def _paste_asset(
+        self,
+        base: Image.Image,
+        *,
+        asset_path: str,
+        box: Tuple[int, int, int, int],
+        shadow: bool = True,
+    ) -> Image.Image:
+        if not asset_path:
+            return base
+
+        asset = self._load_asset_rgba(asset_path)
+        if asset is None:
+            return base
+
+        x0, y0, x1, y1 = [int(v) for v in box]
+        bw = max(1, x1 - x0)
+        bh = max(1, y1 - y0)
+        asset = self._resize_to_contain(asset, (int(bw * 0.98), int(bh * 0.98)))
+
+        x = x0 + max(0, (bw - asset.size[0]) // 2)
+        y = y0 + max(0, (bh - asset.size[1]) // 2)
+
+        base_rgba = base.convert("RGBA")
+        if shadow:
+            try:
+                alpha = asset.getchannel("A")
+                shadow_blob = Image.new("RGBA", asset.size, (0, 0, 0, 120))
+                shadow_layer = Image.new("RGBA", base_rgba.size, (0, 0, 0, 0))
+                shadow_layer.paste(shadow_blob, (x + 10, y + 14), alpha)
+                shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(16))
+                base_rgba = Image.alpha_composite(base_rgba, shadow_layer)
+            except Exception:
+                pass
+
+        try:
+            base_rgba.alpha_composite(asset, dest=(x, y))
+        except Exception:
+            base_rgba.paste(asset, (x, y), asset)
+
+        return base_rgba.convert("RGB")
+
+    @staticmethod
     def default_output_root() -> Path:
         return Path(os.path.expanduser("~")) / ".xhs_system" / "generated_imgs"
 
@@ -475,6 +540,11 @@ class MarketingPosterService:
         keyword = clean_text(str(content.get("keyword") or "")) or "咨询"
         accent_name = clean_text(str(content.get("accent") or "blue")).lower()
         accent = ACCENTS.get(accent_name, ACCENTS["blue"])
+
+        asset_image_path = str(content.get("asset_image_path") or "").strip()
+        asset_image_path = os.path.expanduser(asset_image_path) if asset_image_path else ""
+        if asset_image_path and not os.path.exists(asset_image_path):
+            asset_image_path = ""
 
         cover_bullets = _normalize_list(
             content.get("cover_bullets"),
@@ -550,6 +620,7 @@ class MarketingPosterService:
                     keyword=keyword,
                     accent=accent,
                     disclaimer=disclaimer,
+                    asset_image_path=asset_image_path,
                 ),
             ),
             ("02_outline.png", self._poster_outline(title=title, items=outline_items, keyword=keyword, accent=accent)),
@@ -590,6 +661,7 @@ class MarketingPosterService:
         keyword: str,
         accent: Tuple[int, int, int],
         disclaimer: str,
+        asset_image_path: str = "",
     ) -> Image.Image:
         img = gradient_bg(self.size)
         d = ImageDraw.Draw(img)
@@ -663,6 +735,11 @@ class MarketingPosterService:
             d = ImageDraw.Draw(img)
             d.text((110, 838), price, font=self.fonts.get(size=96, bold=True, serif=False), fill=C.red)
             d.text((360, 905), "元", font=self.fonts.get(size=34, bold=True, serif=False), fill=C.sub)
+
+        if asset_image_path:
+            # 右下角预留区域：不遮挡价格/CTA 文本
+            img = self._paste_asset(img, asset_path=asset_image_path, box=(560, 760, 1010, 1320), shadow=True)
+            d = ImageDraw.Draw(img)
 
         cta_font = self.fonts.get(size=36, bold=True, serif=False)
         prefix = "想了解详情："
