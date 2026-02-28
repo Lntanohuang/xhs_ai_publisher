@@ -1429,61 +1429,25 @@ class XiaohongshuPoster:
             # 确保 www 域名也处于登录态（上传前置加密接口在 www 域名）
             await self._warmup_xhs_sso()
             
-            print("点击发布笔记按钮...")
-            # 根据实际HTML结构点击发布按钮
-            publish_selectors = [
-                ".publish-video .btn",  # 根据日志显示这个选择器工作正常
-                "button:has-text('发布笔记')",
-                ".btn:text('发布笔记')",
-                "//div[contains(@class, 'btn')][contains(text(), '发布笔记')]"
-            ]
-            
-            publish_clicked = False
-            for selector in publish_selectors:
-                try:
-                    print(f"尝试发布按钮选择器: {selector}")
-                    await self.page.wait_for_selector(selector, timeout=5000)
-                    await self.page.click(selector)
-                    print(f"成功点击发布按钮: {selector}")
-                    publish_clicked = True
-                    break
-                except Exception as e:
-                    print(f"发布按钮选择器 {selector} 失败: {e}")
-                    continue
-            
-            if not publish_clicked:
-                await safe_screenshot("debug_publish_button.png")
-                raise Exception("无法找到发布按钮")
-            
+            # 直接导航到发布页（跳过点击"发布笔记"按钮，更稳定不受改版影响）
+            print("直接导航到发布页...")
+            await self.page.goto("https://creator.xiaohongshu.com/publish/publish", wait_until="domcontentloaded")
             await asyncio.sleep(3)
 
-            # 切换到上传图文选项卡
+            # 点击"上传图文"选项卡（发布页可能默认是视频 tab）
             print("切换到上传图文选项卡...")
             try:
-                # 等待选项卡加载
-                await self.page.wait_for_selector(".creator-tab", timeout=10000)
-                
-                # 使用JavaScript直接获取第二个选项卡并点击
-                await self.page.evaluate("""
-                    () => {
-                        const tabs = document.querySelectorAll('.creator-tab');
-                        if (tabs.length > 1) {
-                            tabs[1].click();
-                            return true;
-                        }
-                        return false;
-                    }
-                """)
-                print("使用JavaScript方法点击第二个选项卡")
-                
-                await asyncio.sleep(2)
+                tab = self.page.locator(".creator-tab:has-text('上传图文')").last
+                await tab.wait_for(state="visible", timeout=8000)
+                if "active" not in (await tab.get_attribute("class") or ""):
+                    await tab.click()
+                    print("已点击'上传图文'选项卡")
+                    await asyncio.sleep(2)
+                else:
+                    print("'上传图文'选项卡已是当前激活状态，无需切换")
             except Exception as e:
-                print(f"切换选项卡失败: {e}")
+                print(f"切换上传图文选项卡失败: {e}")
                 await safe_screenshot("debug_tabs.png")
-
-            # 等待页面切换完成
-            await asyncio.sleep(3)
-            # time.sleep(15) # 长时间同步阻塞，应避免，Playwright有自己的等待机制
             
             # 上传图片（如果有）
             print("--- 开始图片上传流程 ---")
@@ -1496,8 +1460,9 @@ class XiaohongshuPoster:
                     await self.page.wait_for_selector(".upload-button", timeout=20000) 
                     await asyncio.sleep(1.5) # 短暂稳定延时
                     if self._auth_issue or ("login" in (self.page.url or "")):
-                        print(f"检测到登录态异常/跳转登录，无法继续上传: {self._auth_issue_url or self.page.url}")
-                        return False
+                        _bad_url = self._auth_issue_url or self.page.url
+                        print(f"检测到登录态异常/跳转登录，无法继续上传: {_bad_url}")
+                        raise RuntimeError(f"登录态已失效，请重新登录后再发布（{_bad_url}）")
 
                     upload_check_js = '''
 	                        () => {
@@ -1990,7 +1955,7 @@ class XiaohongshuPoster:
                 # 如果调用方提供了 images，但图片未上传成功，则停止后续步骤，避免误导“已准备好”
                 if not upload_success:
                     print("图片上传失败，停止后续填写标题/正文。请先确认页面能正常显示上传预览。")
-                    return False
+                    raise RuntimeError("图片上传失败：所有上传方式均失败。请检查图片格式/网络连接，或尝试重新登录")
             
             # 输入标题和内容
             print("--- 开始输入标题和内容 ---")
